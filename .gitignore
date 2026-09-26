@@ -1,0 +1,44 @@
+# Data files — too large for GitHub (GBs of TSV)
+dataset/
+*.tsv
+*.csv
+
+# Model files and cache
+models/
+output/
+*.pkl
+*.pkl.gz
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
