@@ -1,993 +1,665 @@
+"""Optimized business entity resolution. Final submissions are written to output/.
+
+Training uses sampled reference entities, but scans ALL source 2/3 distractors.
+Validation keeps all retrieved negatives and includes unretrieved truths in scoring.
 """
-run_pipeline.py
-================
-ONE-COMMAND entry point for the Amazon ML Challenge 2026 Entity Resolution pipeline.
-
-Run from the student_resource/ directory:
-
-  # Step 1: Run blocking on TRAIN data (generates training candidates)
-  python run_pipeline.py --step block_train
-
-  # Step 2: Run EDA + check blocking recall on train
-  python run_pipeline.py --step eda
-
-  # Step 3: Train the LightGBM classifier
-  python run_pipeline.py --step train
-
-  # Step 4: Run blocking on TEST data
-  python run_pipeline.py --step block_test
-
-  # Step 5: Predict on test data → matching_results.tsv + candidate_pairs.tsv
-  python run_pipeline.py --step predict
-
-  # Step 6: Validate output format (official checker)
-  python run_pipeline.py --step check
-
-  # Step 7: Score on your validation split (before submitting)
-  python run_pipeline.py --step score
-
-  # Run everything end-to-end
-  python run_pipeline.py --step all
-"""
-
-import os
-import sys
-import time
-import shutil
-import logging
-import argparse
-import pickle
+from pathlib import Path
+import sys,os,csv,re,json,time,math,gc,pickle,argparse,zlib,unicodedata,hashlib,shutil
+from collections import defaultdict,Counter
+P=Path(__file__).resolve().parent
+sys.path.insert(0,str(P/'.deps'))
 import numpy as np
-import pandas as pd
-from tqdm import tqdm
-from collections import defaultdict
-
-# ── Paths ──────────────────────────────────────────────────────────────────
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR   = os.path.join(BASE_DIR, 'dataset')
-OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
-MODELS_DIR = os.path.join(BASE_DIR, 'models')
-SRC_DIR    = os.path.join(BASE_DIR, 'src')
-sys.path.insert(0, SRC_DIR)
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(MODELS_DIR, exist_ok=True)
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-log = logging.getLogger(__name__)
-
-# ── Import pipeline modules ─────────────────────────────────────────────────
-from preprocess_utils import preprocess_dataframe
-from features import (
-    FEATURE_COLS, build_feature_matrix, build_lookups, expand_candidates
-)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# BLOCKING — FULLY VECTORIZED (pandas merge, no iterrows loops)
-# ════════════════════════════════════════════════════════════════════════════
-#
-# WHY THE REWRITE:
-#   Old approach:  `for _, row in df.iterrows()` → Python object per row → ~1-2 it/s on 4M rows
-#   New approach:  pandas explode → merge (C-level hash join) → groupby → ~100-1000x faster
-#
-# Key design:
-#   1. Token blocking: explode name_tokens, filter high-IDF tokens, merge, groupby
-#   2. Prefix blocking: vectorized str[:N] column, merge, groupby
-#   3. Address blocking: vectorized addr_key column, merge, groupby
-#   4. TF-IDF blocking: pre-transform all S23 at once, batch slice sparse matrix
-#
-# IDF filter: tokens appearing in >MAX_TOKEN_DF S1 records are skipped.
-# "limited", "private", "services" etc. appear in 100K+ records →
-# joining them would create billions of intermediate rows → OOM.
-
-TOKEN_MIN_LEN   = 3
-PREFIX_LEN      = 5
-MAX_TOKEN_DF    = 30     # Tokens in >30 S1 records are too common to discriminate
-TFIDF_THRESHOLD = 0.20
-TFIDF_TOP_K     = 20
-TFIDF_BATCH     = 200    # S23 rows per dense multiply batch (~706 MB peak RAM)
-
-
-def load_split(split: str):
-    """Load and preprocess all 3 sources for a split, with caching."""
-    cache_path = os.path.join(MODELS_DIR, f'{split}_preprocessed.pkl')
-    if os.path.exists(cache_path):
-        log.info(f"Loading preprocessed {split} data from cache...")
-        with open(cache_path, 'rb') as f:
-            c = pickle.load(f)
-        return c['s1'], c['s2'], c['s3'], c['s23']
-
-    log.info(f"Preprocessing {split} data from raw files...")
-    d   = os.path.join(DATA_DIR, split)
-    pfx = f"{split}_source"
-    s1_raw = pd.read_csv(os.path.join(d, f'{pfx}1.tsv'), sep='\t', dtype=str).fillna('')
-    s2_raw = pd.read_csv(os.path.join(d, f'{pfx}2.tsv'), sep='\t', dtype=str).fillna('')
-    s3_raw = pd.read_csv(os.path.join(d, f'{pfx}3.tsv'), sep='\t', dtype=str).fillna('')
-    s1  = preprocess_dataframe(s1_raw)
-    s2  = preprocess_dataframe(s2_raw)
-    s3  = preprocess_dataframe(s3_raw)
-    s23 = pd.concat([s2, s3], ignore_index=True)
-
-    with open(cache_path, 'wb') as f:
-        pickle.dump({'s1': s1, 's2': s2, 's3': s3, 's23': s23}, f)
-    log.info(f"Cached to {cache_path}")
-    return s1, s2, s3, s23
-
-
-# ─── Helper: explode tokens into long format ─────────────────────────────────
-def _explode_tokens(df, id_col, token_col, min_len, country):
-    """
-    Given a dataframe with a list column (token_col), produce a
-    long-format DataFrame: one row per (entity_id, token) pair.
-    Applies min token length filter and country filter.
-    """
-    sub = df[df['country_clean'] == country][[id_col, token_col]].copy()
-    if sub.empty:
-        return pd.DataFrame(columns=[id_col, 'token'])
-    exp = sub.explode(token_col).rename(columns={token_col: 'token'})
-    exp = exp[exp['token'].str.len() >= min_len]
-    return exp.reset_index(drop=True)
-
-
-# ─── Strategy 1: Chunked Inverted-Index Token Blocking ──────────────────────
-def token_block_fast(s1, s23, country):
-    """
-    Token blocking via inverted index + chunked S23 processing.
-
-    WHY NOT PANDAS MERGE:
-      Merge of 626K S1 tokens × 3M S23 tokens produced 254M rows → OOM.
-      Even with IDF filter (MAX=500), too many pairs for groupby.apply(set).
-
-    THIS APPROACH:
-      1. Build S1 inverted index as a Python dict: token → [s1_entity_ids]
-         (fits in ~50MB RAM; O(n_s1 × avg_tokens) to build)
-      2. Filter dict to MAX_TOKEN_DF=30: removes "limited","private","services" etc.
-      3. Process S23 in chunks of 200K records via Python list iteration.
-         Dict lookup is O(1). At 10M lookups/sec → each chunk takes ~1 sec.
-      4. Aggregate chunk pairs into running result dict.
-
-    Expected runtime: ~5-15 min for India (4.1M S23) vs 1000+ hrs with iterrows.
-    """
-    import gc
-
-    s1c  = s1[s1['country_clean'] == country]
-    s23c = s23[s23['country_clean'] == country]
-    if s1c.empty or s23c.empty:
-        return {}
-
-    log.info(f"  Token [{country}]: S1={len(s1c):,}, S23={len(s23c):,}")
-
-    # ── Step 1: Build S1 inverted index ──────────────────────────────────
-    inv = {}  # token (str) → list of s1_entity_id (str)
-    for s1_id, tokens in zip(s1c['entity_id'], s1c['name_tokens']):
-        for tok in tokens:
-            if len(tok) >= TOKEN_MIN_LEN:
-                if tok in inv:
-                    inv[tok].append(s1_id)
-                else:
-                    inv[tok] = [s1_id]
-
-    # IDF filter: drop tokens appearing in >MAX_TOKEN_DF S1 entities
-    inv = {tok: ids for tok, ids in inv.items() if len(ids) <= MAX_TOKEN_DF}
-    log.info(f"    S1 index: {len(inv):,} discriminative tokens (MAX_DF={MAX_TOKEN_DF})")
-
-    if not inv:
-        return {}
-
-    # ── Step 2: Process S23 in chunks ────────────────────────────────────
-    result  = {}   # s1_entity_id → set of s23_entity_ids
-    s23_ids   = s23c['entity_id'].tolist()
-    s23_toks  = s23c['name_tokens'].tolist()
-    n_s23     = len(s23_ids)
-    CHUNK     = 100_000  # S23 records per iteration; 100K = ~300MB peak per chunk (safe for 16GB)
-
-    for chunk_start in tqdm(range(0, n_s23, CHUNK),
-                            desc=f"Token {country}", leave=False):
-        chunk_end = min(chunk_start + CHUNK, n_s23)
-
-        # Collect (s1_id, s23_id) pairs from this S23 chunk
-        pairs_s1  = []
-        pairs_s23 = []
-        for s23_id, tokens in zip(s23_ids[chunk_start:chunk_end],
-                                   s23_toks[chunk_start:chunk_end]):
-            for tok in tokens:
-                if tok in inv:
-                    matched = inv[tok]
-                    pairs_s23.extend([s23_id] * len(matched))
-                    pairs_s1.extend(matched)
-
-        if not pairs_s1:
-            continue
-
-        # Build DataFrame, dedup, aggregate — cleaner than numpy object arrays
-        chunk_df = pd.DataFrame({'s1_id': pairs_s1, 's23_id': pairs_s23})
-        del pairs_s1, pairs_s23
-        chunk_df.drop_duplicates(inplace=True)
-
-        for s1_id, grp in chunk_df.groupby('s1_id')['s23_id']:
-            vals = set(grp.values)
-            if s1_id in result:
-                result[s1_id].update(vals)
-            else:
-                result[s1_id] = vals
-        del chunk_df
-        gc.collect()
-
-
-    log.info(f"    Token [{country}]: {sum(len(v) for v in result.values()):,} candidate pairs")
-    return result
-
-
-
-
-
-# ─── Strategy 2: Prefix Blocking (inverted index) ────────────────────────────
-def prefix_block_fast(s1, s23, country):
-    """
-    Block on first PREFIX_LEN chars of normalized name.
-    Uses inverted index — no pandas merge, no OOM risk from common prefixes.
-    Common prefixes ('shri', 'ravi') filtered by MAX_PREFIX_DF.
-    Runtime: ~5-10 sec for 4M S23 records (pure dict lookup loop).
-    """
-    s1c  = s1[s1['country_clean'] == country]
-    s23c = s23[s23['country_clean'] == country]
-    if s1c.empty or s23c.empty:
-        return {}
-
-    MAX_PREFIX_DF = 50   # skip prefixes shared by >50 S1 entities
-
-    # Build inverted index: prefix → [s1_entity_ids]
-    inv = {}
-    for s1_id, name in zip(s1c['entity_id'], s1c['name_clean']):
-        pfx = name[:PREFIX_LEN]
-        if len(pfx) >= 3:
-            if pfx in inv:
-                inv[pfx].append(s1_id)
-            else:
-                inv[pfx] = [s1_id]
-
-    # IDF filter: drop very common prefixes
-    inv = {pfx: ids for pfx, ids in inv.items() if len(ids) <= MAX_PREFIX_DF}
-
-    # Query S23
-    result = {}
-    for s23_id, name in zip(s23c['entity_id'], s23c['name_clean']):
-        pfx = name[:PREFIX_LEN]
-        if pfx in inv:
-            for s1_id in inv[pfx]:
-                if s1_id in result:
-                    result[s1_id].add(s23_id)
-                else:
-                    result[s1_id] = {s23_id}
-
-    log.info(f"    Prefix [{country}]: {sum(len(v) for v in result.values()):,} candidate pairs")
-    return result
-
-
-# ─── Strategy 3: Address Blocking (inverted index) ───────────────────────────
-def address_block_fast(s1, s23, country):
-    """
-    Block on first 3 meaningful address tokens (joined as a key).
-    Inverted index — no OOM from common address keys.
-    Runtime: ~5-15 sec for 4M S23 records.
-    """
-    s1c  = s1[s1['country_clean'] == country]
-    s23c = s23[s23['country_clean'] == country]
-    if s1c.empty or s23c.empty:
-        return {}
-
-    MAX_ADDR_DF = 100   # skip address keys shared by >100 S1 entities
-
-    def addr_key(tokens):
-        return ' '.join([t for t in tokens if len(t) >= 3][:3])
-
-    # Build inverted index
-    inv = {}
-    for s1_id, tokens in zip(s1c['entity_id'], s1c['addr_tokens']):
-        key = addr_key(tokens)
-        if len(key) >= 3:
-            if key in inv:
-                inv[key].append(s1_id)
-            else:
-                inv[key] = [s1_id]
-
-    # IDF filter
-    inv = {k: ids for k, ids in inv.items() if len(ids) <= MAX_ADDR_DF}
-
-    # Query S23
-    result = {}
-    for s23_id, tokens in zip(s23c['entity_id'], s23c['addr_tokens']):
-        key = addr_key(tokens)
-        if key in inv:
-            for s1_id in inv[key]:
-                if s1_id in result:
-                    result[s1_id].add(s23_id)
-                else:
-                    result[s1_id] = {s23_id}
-
-    log.info(f"    Address [{country}]: {sum(len(v) for v in result.values()):,} candidate pairs")
-    return result
-
-
-# ─── Strategy 4: Char-Bigram Blocking (inverted index) ───────────────────────
-def bigram_block_fast(s1, s23, country):
-    """
-    Block on character bigrams of first 12 chars. Pairs with >=2 shared
-    bigrams are candidates. Inverted index — no explode+merge OOM.
-    Runtime: ~10-20 sec for 4M S23 records.
-    """
-    s1c  = s1[s1['country_clean'] == country]
-    s23c = s23[s23['country_clean'] == country]
-    if s1c.empty or s23c.empty:
-        return {}
-
-    MAX_BG_DF = 150   # skip bigrams shared by >150 S1 entities
-
-    def get_bigrams(text):
-        t = text[:12]
-        return list({t[i:i+2] for i in range(len(t)-1) if len(t[i:i+2]) == 2})
-
-    # Build inverted index: bigram → [s1_entity_ids]
-    inv = {}
-    for s1_id, name in zip(s1c['entity_id'], s1c['name_clean']):
-        for bg in get_bigrams(name):
-            if bg in inv:
-                inv[bg].append(s1_id)
-            else:
-                inv[bg] = [s1_id]
-
-    # IDF filter
-    inv = {bg: ids for bg, ids in inv.items() if len(ids) <= MAX_BG_DF}
-
-    # Query S23: count bigram overlaps per (s1_id, s23_id) pair
-    result = {}
-    for s23_id, name in zip(s23c['entity_id'], s23c['name_clean']):
-        hits = {}   # s1_id → overlap count
-        for bg in get_bigrams(name):
-            if bg in inv:
-                for s1_id in inv[bg]:
-                    hits[s1_id] = hits.get(s1_id, 0) + 1
-        # Only keep pairs with >=2 shared bigrams
-        for s1_id, cnt in hits.items():
-            if cnt >= 2:
-                if s1_id in result:
-                    result[s1_id].add(s23_id)
-                else:
-                    result[s1_id] = {s23_id}
-
-    log.info(f"    Bigram [{country}]: {sum(len(v) for v in result.values()):,} candidate pairs")
-    return result
-
-
-
-
-# ─── Strategy 5: TF-IDF Blocking (optional, vectorized) ─────────────────────
-def tfidf_block_fast(s1, s23, country):
-    """
-    TF-IDF cosine blocking — pre-transforms all S23 in ONE call, then
-    batch-slices the sparse matrix. No Python loop over rows.
-    ~30-60 min per country (vs 59 hrs with iterrows).
-    """
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.preprocessing import normalize as sk_normalize
-
-    s1c  = s1[s1['country_clean'] == country].reset_index(drop=True)
-    s23c = s23[s23['country_clean'] == country].reset_index(drop=True)
-    if s1c.empty or s23c.empty:
-        return {}
-
-    n_s1, n_s23 = len(s1c), len(s23c)
-    log.info(f"  TF-IDF [{country}]: S1={n_s1:,}, S23={n_s23:,}")
-
-    vec = TfidfVectorizer(
-        analyzer='char_wb', ngram_range=(2, 4),
-        min_df=2, max_features=150_000, sublinear_tf=True, dtype=np.float32,
-    )
-    log.info(f"    Fitting on S1...")
-    s1_mat  = vec.fit_transform(s1c['name_clean'].tolist())
-    log.info(f"    Transforming S23 in one shot...")
-    s23_mat = vec.transform(s23c['name_clean'].tolist())
-
-    s1_norm  = sk_normalize(s1_mat,  norm='l2', copy=False)
-    s23_norm = sk_normalize(s23_mat, norm='l2', copy=False)
-    s1_ids   = s1c['entity_id'].tolist()
-    s23_ids  = s23c['entity_id'].tolist()
-
-    result = {}
-    for start in tqdm(range(0, n_s23, TFIDF_BATCH),
-                      desc=f"TF-IDF {country}", leave=False):
-        batch = s23_norm[start:start + TFIDF_BATCH]
-        sims  = (batch @ s1_norm.T).toarray()          # (BATCH, n_s1) float32
-        for i, row_sims in enumerate(sims):
-            k       = min(TFIDF_TOP_K, n_s1)
-            top_idx = np.argpartition(row_sims, -k)[-k:]
-            top_idx = top_idx[np.argsort(row_sims[top_idx])[::-1]]
-            s23_id  = s23_ids[start + i]
-            for j in top_idx:
-                if row_sims[j] >= TFIDF_THRESHOLD:
-                    result.setdefault(s1_ids[j], set()).add(s23_id)
-                else:
-                    break
-    log.info(f"    TF-IDF [{country}]: {sum(len(v) for v in result.values()):,} candidate pairs")
-    return result
-
-
-# ─── Master Blocking Orchestrator ────────────────────────────────────────────
-def run_blocking(split: str, out_filename: str = 'candidate_pairs.tsv',
-                 skip_tfidf: bool = False):
-    """
-    Run all blocking strategies (vectorized) and write candidate_pairs.tsv.
-
-    Expected runtime:
-      - Token + Prefix + Address + Bigram: ~20-40 min total
-      - + TF-IDF: additional ~1-2 hrs per country
-    """
-    import gc
-    t0 = time.time()
-    s1, s2, s3, s23 = load_split(split)
-
-    # ── FREE s2 and s3 immediately — they're already merged into s23 ──────
-    # This saves ~7 GB RAM (s2 ≈ 3.5 GB, s3 ≈ 3.7 GB with token lists).
-    # s23 = pd.concat([s2, s3]) was built at cache time; we never need s2/s3 again here.
-    del s2, s3
-    gc.collect()
-    log.info("Freed s2 + s3 from RAM (using s23 only)")
-
-    countries = sorted(set(s1['country_clean'].unique()) | set(s23['country_clean'].unique()))
-    countries = [c for c in countries if c]
-    log.info(f"Countries in {split}: {countries}")
-
-    all_cands = {}   # { s1_entity_id → set of s23_ids }
-
-    for country in countries:
-        log.info(f"\n{'='*50}\n  Country: {country}\n{'='*50}")
-
-        for fn, name in [
-            (token_block_fast,   'Token  '),
-            (prefix_block_fast,  'Prefix '),
-            (address_block_fast, 'Address'),
-            (bigram_block_fast,  'Bigram '),
-        ]:
-            t1 = time.time()
-            cands = fn(s1, s23, country)
-            for s1_id, cset in cands.items():
-                if s1_id in all_cands:
-                    all_cands[s1_id].update(cset)
-                else:
-                    all_cands[s1_id] = set(cset)
-            log.info(f"    {name}: done in {time.time()-t1:.1f}s")
-
-        if not skip_tfidf:
-            t1    = time.time()
-            cands = tfidf_block_fast(s1, s23, country)
-            for s1_id, cset in cands.items():
-                if s1_id in all_cands:
-                    all_cands[s1_id].update(cset)
-                else:
-                    all_cands[s1_id] = set(cset)
-            log.info(f"    TF-IDF: done in {(time.time()-t1)/60:.1f}m")
-        else:
-            log.info("    TF-IDF: SKIPPED (--no-tfidf)")
-
-    # Write candidate_pairs.tsv — every S1 entity must appear
-    log.info("\nWriting candidate_pairs.tsv ...")
-    rows = []
-    for _, row in s1.iterrows():
-        s1_id = row['entity_id']
-        cands = all_cands.get(s1_id, set())
-        rows.append({
-            'source1_entity_id'   : s1_id,
-            'candidate_entity_ids': ','.join(sorted(cands)),
-        })
-
-    cand_df  = pd.DataFrame(rows)
-    out_path = os.path.join(OUTPUT_DIR, out_filename)
-    cand_df.to_csv(out_path, sep='\t', index=False)
-
-    non_empty   = cand_df[cand_df['candidate_entity_ids'] != '']
-    total_cands = non_empty['candidate_entity_ids'].apply(lambda x: len(x.split(','))).sum()
-    log.info(f"\n✅ Blocking done in {(time.time()-t0)/60:.1f}m")
-    log.info(f"   {len(non_empty):,} S1 entities with candidates | {total_cands:,} total pairs")
-    log.info(f"   Written to: {out_path}")
-    return all_cands, s1, s23
-
-# ════════════════════════════════════════════════════════════════════════════
-# TRAINING
-# ════════════════════════════════════════════════════════════════════════════
-import lightgbm as lgb
-
-LGBM_PARAMS = {
-    'objective':         'binary',
-    'metric':            'binary_logloss',
-    'num_leaves':        127,
-    'learning_rate':     0.05,
-    'n_estimators':      1000,
-    'min_child_samples': 20,
-    'subsample':         0.8,
-    'colsample_bytree':  0.8,
-    'reg_alpha':         0.1,
-    'reg_lambda':        0.1,
-    'random_state':      42,
-    'n_jobs':            -1,
-    'verbose':           -1,
-}
-
-
-def f05_score(prec, rec):
-    """F0.5: weights precision 2x over recall."""
-    if prec + rec == 0:
-        return 0.0
-    return 1.25 * prec * rec / (0.25 * prec + rec)
-
-
-def load_gt(gt_path):
-    gt_df = pd.read_csv(gt_path, sep='\t', dtype=str).fillna('')
-    return {
-        r['source1_entity_id']: (
-            set(r['matched_entity_ids'].split(','))
-            if r['matched_entity_ids'].strip() else set()
-        )
-        for r in gt_df.to_dict('records')
-    }
-
-
-def sweep_threshold(pairs_df, probs, gt_dict, s1_ids_all):
-    """Find optimal F0.5 decision threshold."""
-    best_t, best_f = 0.5, 0.0
-    for thresh in np.linspace(0.30, 0.80, 51):
-        matched = (
-            pairs_df[probs >= thresh]
-            .groupby('source1_entity_id')['candidate_entity_id']
-            .apply(lambda x: set(x))
-        ).to_dict()
-
-        scores = []
-        for s1_id in s1_ids_all:
-            true_set = gt_dict.get(s1_id, set())
-            pred_set = matched.get(s1_id, set())
-            if not true_set and not pred_set:
-                scores.append(1.0)
-            elif not true_set and pred_set:
-                scores.append(0.0)
-            else:
-                tp = len(true_set & pred_set)
-                prec = tp / len(pred_set) if pred_set else 0.0
-                rec  = tp / len(true_set) if true_set else 0.0
-                scores.append(f05_score(prec, rec))
-
-        score = float(np.mean(scores))
-        if score > best_f:
-            best_f, best_t = score, thresh
-
-    return best_t, best_f
-
-
-def run_training():
-    """Train LightGBM on training candidates."""
-    t0 = time.time()
-
-    # Load train split
-    s1, s2, s3, s23 = load_split('train')
-
-    # Load train candidates
-    cand_path = os.path.join(OUTPUT_DIR, 'candidate_pairs_train.tsv')
-    if not os.path.exists(cand_path):
-        log.error(f"Run 'block_train' step first. Missing: {cand_path}")
-        sys.exit(1)
-
-    log.info("Loading & expanding train candidates...")
-    cand_df  = pd.read_csv(cand_path, sep='\t', dtype=str).fillna('')
-    pairs_df = expand_candidates(cand_df)
-    log.info(f"  {len(pairs_df):,} candidate pairs")
-
-    # Ground truth labels — vectorized (NOT apply(axis=1) which OOMs on 82M rows)
-    gt_path = os.path.join(DATA_DIR, 'train', 'train_ground_truth.tsv')
-    gt_dict  = load_gt(gt_path)
-    # Build a set of "s1_id|s23_id" keys for O(1) lookup
-    gt_key_set = {f"{s1_id}|{mid}"
-                  for s1_id, mids in gt_dict.items()
-                  for mid in mids}
-    log.info(f"  Ground truth: {len(gt_key_set):,} true match pairs")
-
-    # Vectorized label assignment — isin() is C-level, no Python loop
-    pair_keys       = pairs_df['source1_entity_id'] + '|' + pairs_df['candidate_entity_id']
-    pairs_df['label'] = pair_keys.isin(gt_key_set).astype(np.int8)
-    del pair_keys, gt_key_set
-
-    pos_df = pairs_df[pairs_df['label'] == 1]
-    neg_df = pairs_df[pairs_df['label'] == 0]
-    pos    = len(pos_df)
-    neg    = len(neg_df)
-    log.info(f"  Labels: {pos:,} positive, {neg:,} negative (ratio 1:{neg//max(pos,1)})")
-
-    # Sample negatives — keep all positives + 5× negatives (enough for LightGBM)
-    NEG_RATIO  = 5
-    neg_sample = neg_df.sample(n=min(pos * NEG_RATIO, neg), random_state=42)
-    pairs_df   = pd.concat([pos_df, neg_sample], ignore_index=True)
-    log.info(f"  Sampled training set: {len(pairs_df):,} pairs ({pos:,} pos + {len(neg_sample):,} neg)")
-    del pos_df, neg_df, neg_sample
-
-    import gc; gc.collect()
-
-    # Build lookups + features
-    log.info("Building lookups...")
-    s1_lookup, s23_lookup = build_lookups(s1, s23)
-    log.info("Computing features...")
-    feat_df = build_feature_matrix(
-        pairs_df[['source1_entity_id', 'candidate_entity_id']], s1_lookup, s23_lookup
-    )
-    feat_df['label'] = pairs_df['label'].values
-    feat_df.to_pickle(os.path.join(MODELS_DIR, 'train_features.pkl'))
-
-
-    # Train/Val split (by S1 entity, not by pair)
-    np.random.seed(42)
-    s1_ids = s1['entity_id'].tolist()
-    np.random.shuffle(s1_ids)
-    split_n = int(len(s1_ids) * 0.80)
-    train_ids = set(s1_ids[:split_n])
-    val_ids   = set(s1_ids[split_n:])
-
-    train_mask = feat_df['source1_entity_id'].isin(train_ids)
-    val_mask   = feat_df['source1_entity_id'].isin(val_ids)
-
-    X_tr = feat_df[train_mask][FEATURE_COLS].values.astype(np.float32)
-    y_tr = feat_df[train_mask]['label'].values
-    X_v  = feat_df[val_mask][FEATURE_COLS].values.astype(np.float32)
-    y_v  = feat_df[val_mask]['label'].values
-
-    scale_pw = (y_tr == 0).sum() / max((y_tr == 1).sum(), 1)
-    log.info(f"Training: {len(X_tr):,} | Val: {len(X_v):,} | scale_pos_weight: {scale_pw:.1f}")
-
-    model = lgb.LGBMClassifier(**{**LGBM_PARAMS, 'scale_pos_weight': scale_pw})
-    model.fit(
-        X_tr, y_tr,
-        eval_set=[(X_v, y_v)],
-        callbacks=[
-            lgb.early_stopping(stopping_rounds=50, verbose=True),
-            lgb.log_evaluation(period=100),
-        ],
-    )
-
-    # Feature importance
-    imp = pd.Series(model.feature_importances_, index=FEATURE_COLS).sort_values(ascending=False)
-    log.info("Top features:")
-    for feat, v in imp.head(10).items():
-        log.info(f"  {feat:40s}: {v:.0f}")
-
-    # Threshold sweep
-    log.info("Sweeping threshold on validation set...")
-    val_pairs = feat_df[val_mask][['source1_entity_id', 'candidate_entity_id']].reset_index(drop=True)
-    val_probs = model.predict_proba(X_v)[:, 1]
-    val_gt    = {k: v for k, v in gt_dict.items() if k in val_ids}
-    val_s1_all = [i for i in s1['entity_id'] if i in val_ids]
-    best_thresh, best_f05 = sweep_threshold(val_pairs, val_probs, val_gt, val_s1_all)
-
-    log.info(f"Best threshold: {best_thresh:.4f} → Val F0.5 = {best_f05:.4f}")
-
-    # Save
-    model_path  = os.path.join(MODELS_DIR, 'lgbm_model.pkl')
-    thresh_path = os.path.join(MODELS_DIR, 'best_threshold.txt')
-    with open(model_path, 'wb') as f:
-        pickle.dump(model, f)
-    with open(thresh_path, 'w') as f:
-        f.write(str(best_thresh))
-
-    log.info(f"\n✅ Training complete in {(time.time()-t0)/60:.1f}m")
-    log.info(f"   Model: {model_path}")
-    log.info(f"   Threshold: {best_thresh:.4f}  |  Val F0.5: {best_f05:.4f}")
-    return model, best_thresh, best_f05
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# PREDICTION
-# ════════════════════════════════════════════════════════════════════════════
-
-def run_prediction(split: str = 'test', threshold_override: float = None):
-    """Run inference and write matching_results.tsv."""
-    import gc
-    t0 = time.time()
-
-    # Load model + threshold
-    model_path  = os.path.join(MODELS_DIR, 'lgbm_model.pkl')
-    thresh_path = os.path.join(MODELS_DIR, 'best_threshold.txt')
-    if not os.path.exists(model_path):
-        log.error("No model found. Run 'train' step first.")
-        sys.exit(1)
-    with open(model_path, 'rb') as f:
-        model = pickle.load(f)
-    threshold = threshold_override
-    if threshold is None:
-        with open(thresh_path) as f:
-            threshold = float(f.read().strip())
-    log.info(f"Loaded model. Threshold: {threshold:.4f}")
-
-    # Load data
-    s1, s2, s3, s23 = load_split(split)
-
-    # Load candidates
-    cand_fname = 'candidate_pairs.tsv'
-    cand_path  = os.path.join(OUTPUT_DIR, cand_fname)
-    if not os.path.exists(cand_path):
-        log.error(f"Run 'block_test' step first. Missing: {cand_path}")
-        sys.exit(1)
-
-    cand_df  = pd.read_csv(cand_path, sep='\t', dtype=str).fillna('')
-    pairs_df = expand_candidates(cand_df)
-    n_pairs  = len(pairs_df)
-    log.info(f"  {n_pairs:,} candidate pairs to score")
-
-    # Build lookups ONCE and pre-extract ALL field arrays upfront
-    # This avoids per-chunk dict construction (the bottleneck in the old approach)
-    log.info("Building lookups + extracting fields...")
-    s1_lookup, s23_lookup = build_lookups(s1, s23)
-
-    empty = {'name_clean': '', 'addr_clean': '', 'country_clean': ''}
-    s1_ids_arr  = pairs_df['source1_entity_id'].values
-    s23_ids_arr = pairs_df['candidate_entity_id'].values
-
-    log.info("  Extracting S1 fields...")
-    s1_name = [s1_lookup.get(i, empty)['name_clean']    for i in s1_ids_arr]
-    s1_addr = [s1_lookup.get(i, empty)['addr_clean']    for i in s1_ids_arr]
-    s1_ctry = [s1_lookup.get(i, empty)['country_clean'] for i in s1_ids_arr]
-    log.info("  Extracting S23 fields...")
-    s23_name = [s23_lookup.get(i, empty)['name_clean']    for i in s23_ids_arr]
-    s23_addr = [s23_lookup.get(i, empty)['addr_clean']    for i in s23_ids_arr]
-    s23_ctry = [s23_lookup.get(i, empty)['country_clean'] for i in s23_ids_arr]
-    del s1_lookup, s23_lookup
-    gc.collect()
-    log.info("  Fields extracted. Starting chunked scoring...")
-
-    # Score in chunks — call vectorized feature helpers DIRECTLY on string slices
-    # No dict construction per chunk → each 500K chunk takes ~20 sec not ~8 min
-    from src.features import (
-        _batch_jaro_winkler, _batch_ratio, _batch_partial_ratio,
-        _batch_token_set_ratio, _batch_token_sort_ratio,
-        _jaccard_tokens_vec, _jaccard_char3_vec, _len_ratio_vec,
-        _prefix_ratio_vec, _numeric_jaccard_vec, _first_token_match_vec,
-    )
-
-    PRED_CHUNK = 13_000_000   # 13M×136B = ~1.77 GB peak RAM per chunk (within 1.8 GB budget)
-    matched_s1  = []
-    matched_s23 = []
-    n_matches   = 0
-
-    log.info(f"Scoring {n_pairs:,} pairs in chunks of {PRED_CHUNK:,}...")
-    n_chunks = (n_pairs + PRED_CHUNK - 1) // PRED_CHUNK
-
-    for chunk_idx in tqdm(range(n_chunks), desc="Scoring chunks"):
-        start = chunk_idx * PRED_CHUNK
-        end   = min(start + PRED_CHUNK, n_pairs)
-        sz    = end - start
-
-        n1 = s1_name[start:end];  n2 = s23_name[start:end]
-        a1 = s1_addr[start:end];  a2 = s23_addr[start:end]
-        c1 = s1_ctry[start:end];  c2 = s23_ctry[start:end]
-
-        # Build feature matrix directly from string lists — no dicts, no DataFrame
-        feat = np.empty((sz, len(FEATURE_COLS)), dtype=np.float32)
-        col = 0
-        feat[:, col] = _batch_jaro_winkler(n1, n2);          col += 1
-        feat[:, col] = _batch_ratio(n1, n2);                  col += 1
-        feat[:, col] = _batch_partial_ratio(n1, n2);          col += 1
-        feat[:, col] = _batch_token_set_ratio(n1, n2);        col += 1
-        feat[:, col] = _batch_token_sort_ratio(n1, n2);       col += 1
-        feat[:, col] = _jaccard_tokens_vec(n1, n2);           col += 1
-        feat[:, col] = _jaccard_char3_vec(n1, n2);            col += 1
-        feat[:, col] = _len_ratio_vec(n1, n2);                col += 1
-        feat[:, col] = _prefix_ratio_vec(n1, n2);             col += 1
-        feat[:, col] = _batch_ratio(a1, a2);                  col += 1
-        feat[:, col] = _batch_token_set_ratio(a1, a2);        col += 1
-        feat[:, col] = _batch_partial_ratio(a1, a2);          col += 1
-        feat[:, col] = _jaccard_tokens_vec(a1, a2);           col += 1
-        nj, nf = _numeric_jaccard_vec(a1, a2)
-        feat[:, col] = nj;                                     col += 1
-        feat[:, col] = nf;                                     col += 1
-        feat[:, col] = _first_token_match_vec(a1, a2);        col += 1
-        feat[:, col] = np.array([float(x==y) for x,y in zip(c1,c2)], dtype=np.float32); col += 1
-        # Combined
-        name_stack = feat[:, 0:6]   # jaro, lev, tsr, tsor, jac, char3 — wait, reorder
-        # Correct indices: jaro=0, lev=1, partial=2, tsr=3, tsort=4, jac_tok=5, char3=6
-        name_stack = np.stack([feat[:,0], feat[:,1], feat[:,5], feat[:,6], feat[:,3], feat[:,4]])
-        feat[:, col] = name_stack.max(axis=0);                 col += 1   # max_name_sim
-        feat[:, col] = name_stack.mean(axis=0);                col += 1   # mean_name_sim
-        addr_stack = np.stack([feat[:,9], feat[:,12], feat[:,13]])
-        feat[:, col] = addr_stack.max(axis=0);                 col += 1   # max_addr_sim
-        feat[:, col] = feat[:, col-3] * feat[:, col-1]        # name_addr_product (max_name * max_addr)
-
-        probs = model.predict_proba(feat)[:, 1]
-        mask  = probs >= threshold
-        n_matches += int(mask.sum())
-        matched_s1.extend(s1_ids_arr[start:end][mask].tolist())
-        matched_s23.extend(s23_ids_arr[start:end][mask].tolist())
-
-        del feat, probs, mask
-        gc.collect()
-
-    log.info(f"  {n_matches:,} matches predicted (threshold={threshold:.4f})")
-
-    # Build matching_results.tsv
-    matched_df = pd.DataFrame({'source1_entity_id': matched_s1,
-                               'candidate_entity_id': matched_s23})
-    matched = (
-        matched_df
-        .groupby('source1_entity_id')['candidate_entity_id']
-        .apply(lambda x: ','.join(sorted(set(x))))
-        .reset_index()
-    )
-    matched.columns = ['source1_entity_id', 'matched_entity_ids']
-
-    # Ensure ALL S1 entities appear
-    all_s1 = pd.DataFrame({'source1_entity_id': s1['entity_id'].tolist()})
-    results = all_s1.merge(matched, on='source1_entity_id', how='left')
-    results['matched_entity_ids'] = results['matched_entity_ids'].fillna('')
-
-    # Write outputs
-    suffix = '' if split == 'test' else f'_{split}'
-    out_path = os.path.join(OUTPUT_DIR, f'matching_results{suffix}.tsv')
-    results.to_csv(out_path, sep='\t', index=False)
-
-    singletons = (results['matched_entity_ids'] == '').sum()
-    total_links = results['matched_entity_ids'].apply(
-        lambda x: len(x.split(',')) if x else 0
-    ).sum()
-    log.info(f"\n✅ Prediction complete in {(time.time()-t0)/60:.1f}m")
-    log.info(f"   {len(results):,} S1 entities | {singletons:,} singletons | {total_links:,} links")
-    log.info(f"   matching_results: {out_path}")
-    return results
-
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# SCORING
-# ════════════════════════════════════════════════════════════════════════════
-
-def run_scoring():
-    """Score train-split predictions against ground truth."""
-    pred_path = os.path.join(OUTPUT_DIR, 'matching_results_train.tsv')
-    gt_path   = os.path.join(DATA_DIR, 'train', 'train_ground_truth.tsv')
-
-    if not os.path.exists(pred_path):
-        log.error(f"No validation predictions at {pred_path}. "
-                  "Run: python run_pipeline.py --step predict --split train")
-        sys.exit(1)
-
-    gt_dict  = load_gt(gt_path)
-    pred_df  = pd.read_csv(pred_path, sep='\t', dtype=str).fillna('')
-    pred_map = {}
-    for _, row in pred_df.iterrows():
-        s1_id = row['source1_entity_id']
-        mids  = str(row['matched_entity_ids']).strip()
-        pred_map[s1_id] = set(mids.split(',')) if mids else set()
-
-    scores = []
-    tp_t, fp_t, fn_t = 0, 0, 0
-    sing_ok, sing_bad = 0, 0
-
-    for s1_id, true_set in gt_dict.items():
-        pred_set = pred_map.get(s1_id, set())
-        if not true_set and not pred_set:
-            scores.append(1.0); sing_ok += 1
-        elif not true_set and pred_set:
-            scores.append(0.0); sing_bad += 1; fp_t += len(pred_set)
-        else:
-            tp = len(true_set & pred_set)
-            fp = len(pred_set - true_set)
-            fn = len(true_set - pred_set)
-            prec = tp / len(pred_set) if pred_set else 0.0
-            rec  = tp / len(true_set) if true_set else 0.0
-            scores.append(f05_score(prec, rec))
-            tp_t += tp; fp_t += fp; fn_t += fn
-
-    macro = float(np.mean(scores))
-    gp = tp_t / (tp_t + fp_t) if tp_t + fp_t else 0.0
-    gr = tp_t / (tp_t + fn_t) if tp_t + fn_t else 0.0
-
-    print("\n" + "="*60)
-    print(f"  📊 MACRO F0.5:    {macro:.6f}")
-    print(f"  Global Precision: {gp:.4f}")
-    print(f"  Global Recall:    {gr:.4f}")
-    print(f"  TP={tp_t:,}  FP={fp_t:,}  FN={fn_t:,}")
-    print(f"  Singletons correct: {sing_ok:,}  |  False merges: {sing_bad:,}")
-    print("="*60 + "\n")
-    return macro
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# FORMAT CHECK
-# ════════════════════════════════════════════════════════════════════════════
-
-def run_format_check():
-    """Run official validate_submission.py."""
-    import subprocess
-    validator = os.path.join(BASE_DIR, 'utils', 'validate_submission.py')
-    matching  = os.path.join(OUTPUT_DIR, 'matching_results.tsv')
-    candidate = os.path.join(OUTPUT_DIR, 'candidate_pairs.tsv')
-    test_dir  = os.path.join(DATA_DIR, 'test')
-
-    result = subprocess.run(
-        [sys.executable, validator,
-         '--matching', matching, '--candidate', candidate, '--test-dir', test_dir],
-        capture_output=True, text=True, cwd=BASE_DIR
-    )
-    print(result.stdout)
-    if result.stderr:
-        print(result.stderr)
-    if result.returncode == 0:
-        log.info("✅ PASS — safe to upload!")
+from rapidfuzz import fuzz,process
+from rapidfuzz.distance import JaroWinkler,Levenshtein
+from text_unidecode import unidecode
+RESULTS=P/'output'; RESULTS.mkdir(parents=True,exist_ok=True)
+OUT=RESULTS/'.cache'; OUT.mkdir(parents=True,exist_ok=True)
+MODELS=P/'models'; MODELS.mkdir(parents=True,exist_ok=True)
+VERSION=1
+START=time.monotonic()
+def log(s): print(f'[{(time.monotonic()-START)/60:.1f}m] {s}',flush=True)
+def probabilities(model,x):
+ return model.booster_.predict(x,num_threads=model.n_jobs)
+
+def check():
+ from utils.validate_submission import validate_streaming
+ validate_streaming()
+def commit_output(temp,path):
+ for _ in range(8):
+  try: temp.replace(path); return
+  except PermissionError: time.sleep(.25)
+ # Some Windows file watchers deny rename even after writers close.
+ shutil.copyfile(temp,path)
+def rows(split,source):
+ with (P/f'dataset/{split}/{split}_source{source}.tsv').open(encoding='utf-8',newline='') as f:
+  yield from csv.DictReader(f,delimiter='\t')
+def normalized_rows(split,source,country):
+ """Cache normalized source rows once; replay bounded chunks for reference shards."""
+ path=OUT/f'cache_{split}_{country}_{source}.pkl'; stamp=path.with_suffix('.json')
+ raw_path=P/f'dataset/{split}/{split}_source{source}.tsv'
+ signature={'version':VERSION,'size':raw_path.stat().st_size,'mtime':raw_path.stat().st_mtime_ns}
+ if path.exists() and stamp.exists() and json.loads(stamp.read_text())==signature:
+  with path.open('rb') as f:
+   while True:
+    try: chunk=pickle.load(f)
+    except EOFError: break
+    yield from chunk
+  return
+ if stamp.exists(): stamp.unlink()
+ chunk=[]
+ with path.open('wb') as f:
+  for raw in rows(split,source):
+   if raw['country'].lower().strip()!=country: continue
+   r=record(raw); chunk.append(r); yield r
+   if len(chunk)>=25000: pickle.dump(chunk,f,pickle.HIGHEST_PROTOCOL); chunk=[]
+  if chunk: pickle.dump(chunk,f,pickle.HIGHEST_PROTOCOL)
+ stamp.write_text(json.dumps(signature),encoding='utf-8')
+def stable(s): return zlib.crc32(s.encode('utf-8'))
+WORDS=re.compile(r'[^\w]+',re.UNICODE)
+URL=re.compile(r'(?:https?://)?(?:www\.)?([a-z0-9-]+)\.(?:com|net|org|in|fr|co)(?:\.[a-z]+)?(?:/\S*)?')
+NUM=re.compile(r'\d+')
+ABBR={'pvt':'private','ltd':'limited','inc':'incorporated','corp':'corporation','co':'company',
+ 'intl':'international','mfg':'manufacturing','svcs':'services','mgmt':'management',
+ 'rd':'road','ave':'avenue','blvd':'boulevard','hwy':'highway','ste':'suite'}
+LEGAL=set('private limited incorporated corporation company llc llp pte pvt ltd inc corp co sa sas sarl eurl and the'.split())
+def clean(s):
+ s=URL.sub(r' \1 ',s.lower()).replace('&',' and ')
+ if not s.isascii(): s=unidecode(s)
+ return ' '.join(ABBR.get(w,str(int(w)) if w.isdigit() and len(w)<12 else w) for w in WORDS.sub(' ',s).split())
+def record(r):
+ n,a=clean(r['business_name']),clean(r['business_address'])
+ core=' '.join(w for w in n.split() if w not in LEGAL)
+ return (r['entity_id'],n,a,r['country'].lower().strip(),core or n)
+def keys(r):
+ _,n,a,c,core=r; nt=set(core.split()); at=a.split(); ns=NUM.findall(a)
+ out=set()
+ for tag,s in [('n',n),('c',core),('s',' '.join(sorted(nt))),('a',a)]:
+  if s: out.add(tag+':'+s)
+ if len(core)>=5:
+  out.add('p:'+core[:6]); out.add('q:'+core[-6:])
+ for w in nt:
+  if len(w)>=3: out.add('t:'+w)
+  if len(w)>=6:
+   out.add('w:'+w[:4]+w[-2:])
+ # Combinations of common words are often distinctive even when each word is not.
+ ts=sorted(nt)
+ for i,u in enumerate(ts[:8]):
+  for v in ts[i+1:8]:
+   out.add('j:'+u+':'+v)
+   if len(u)>=4 and len(v)>=4: out.add('k:'+u[:4]+':'+v[:4])
+ compact=core.replace(' ','')
+ if compact:
+  out.add('m:'+compact)
+  if len(compact)>=7: out.add('f:'+compact[:8])
+ if len(at)>=2: out.add('h:'+' '.join(at[:3]))
+ for w in set(at):
+  if len(w)>=5 and not w.isdigit(): out.add('b:'+w)
+ for u,v in zip(at,at[1:]):
+  if len(u)>=3 and len(v)>=3 and not u.isdigit() and not v.isdigit(): out.add('e:'+u+':'+v)
+ # Numeric+word address keys survive reordered addresses and name translation.
+ if ns:
+  for number in set(ns[:3]):
+   for w in set(at):
+    if len(w)>=4 and not w.isdigit(): out.add('d:'+number+':'+w)
+  nums=sorted(set(ns))[:6]
+  for i,u in enumerate(nums):
+   for v in nums[i+1:]: out.add('v:'+u+':'+v)
+  for u in ts[:4]:
+   if len(u)>=3:
+    for n in nums: out.add('x:'+u[:4]+':'+n)
+ return out
+CAP={'n':150,'c':150,'s':150,'a':100,'p':60,'q':40,'t':45,'w':35,'h':100,'d':45,'b':15,'e':35,
+ 'j':100,'k':75,'m':150,'f':80,'v':60,'x':60}
+class Index:
+ def __init__(self,records):
+  self.records=records; self.inv={}; self.context_counts=Counter(k for r in records for k in context_keys(r))
+  for i,r in enumerate(records):
+   for k in keys(r):
+    if k not in self.inv: self.inv[k]=i
     else:
-        log.error("❌ FAIL — fix errors before submitting.")
-    return result.returncode == 0
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# EDA
-# ════════════════════════════════════════════════════════════════════════════
-
-def run_eda():
-    """Quick EDA + blocking recall check."""
-    import subprocess
-    subprocess.run([sys.executable, os.path.join(SRC_DIR, '00_eda.py')], cwd=BASE_DIR)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ════════════════════════════════════════════════════════════════════════════
-
+     v=self.inv[k]
+     if v is None: continue
+     if isinstance(v,int): self.inv[k]=[v,i]
+     elif len(v)<CAP[k[0]]: v.append(i)
+     else: self.inv[k]=None
+  self.inv={k:v for k,v in self.inv.items() if v is not None}
+ def restrict_global(self,split,country):
+  # Use full-reference block frequencies even when fitting on sampled anchors.
+  counts=Counter(); wanted=set(self.inv)|set(self.context_counts)
+  for raw in rows(split,1):
+   if raw['country'].lower().strip()!=country: continue
+   for k in keys(record(raw)):
+    if k in wanted: counts[k]+=1
+  self.inv={k:v for k,v in self.inv.items() if counts[k]<=CAP[k[0]]}
+  self.context_counts={k:counts[k] for k in self.context_counts}
+ def query(self,r):
+  hits=set()
+  for k in keys(r):
+   v=self.inv.get(k)
+   if v is not None:
+    if isinstance(v,int): hits.add(v)
+    else: hits.update(v)
+  return hits
+def overlap(a,b):
+ u=a|b
+ return len(a&b)/len(u) if u else 0.
+FEATURES=[]
+for f in ['name','core','address']:
+ FEATURES += [f+'_'+x for x in ['ratio','sort','set','partial','jw','jaccard','contain','length_ratio','exact','missing']]
+FEATURES += ['number_jaccard','number_conflict','number_common','number_missing',
+ 'first_number_equal','name_number_conflict','name_length','address_length','source3','name_addr_product',
+ 'compact_name_ratio','compact_name_partial']
+def features(x,y):
+ out=[]
+ for a,b in [(x[1],y[1]),(x[4],y[4]),(x[2],y[2])]:
+  sa,sb=set(a.split()),set(b.split()); both=bool(a and b)
+  out.extend([fuzz.ratio(a,b)/100 if both else 0,
+   fuzz.token_sort_ratio(a,b)/100 if both else 0,
+   fuzz.token_set_ratio(a,b)/100 if both else 0,
+   fuzz.partial_ratio(a,b)/100 if both else 0,
+   JaroWinkler.normalized_similarity(a,b) if both else 0,
+   overlap(sa,sb),len(sa&sb)/max(1,min(len(sa),len(sb))),
+   min(len(a),len(b))/max(1,len(a),len(b)),float(both and a==b),float(not both)])
+ na,nb=set(NUM.findall(x[2])),set(NUM.findall(y[2]))
+ ia,ib=NUM.findall(x[2]),NUM.findall(y[2]); nn1,nn2=set(NUM.findall(x[1])),set(NUM.findall(y[1]))
+ out.extend([overlap(na,nb),float(bool(na and nb) and not na&nb),len(na&nb),float(not na or not nb),
+  float(bool(ia and ib) and ia[0]==ib[0]),float(bool(nn1 and nn2) and nn1!=nn2),
+  min(len(x[1]),len(y[1])),min(len(x[2]),len(y[2])),float(y[0].startswith('S3')),out[10]*out[20],
+  fuzz.ratio(x[4].replace(' ',''),y[4].replace(' ',''))/100 if x[4] and y[4] else 0,
+  fuzz.partial_ratio(x[4].replace(' ',''),y[4].replace(' ',''))/100 if x[4] and y[4] else 0])
+ return out
+CONTEXT_FEATURES=['reference_name_frequency','reference_core_frequency','reference_address_frequency']
+SOURCE_FEATURES=['source_core_frequency','source_core_address_frequency']
+EXTRA_FEATURES=['unmatched_left_numbers','unmatched_right_numbers','number_delta_log','number_near_miss',
+ 'unmatched_number_similarity','name_substitution_rate','name_insertion_rate','name_deletion_rate',
+ 'worst_name_token_similarity','mean_name_token_similarity']
+def extra_features(x,y):
+ na,nb=set(NUM.findall(x[2])),set(NUM.findall(y[2])); da,db=na-nb,nb-na
+ ds=[abs(int(a)-int(b)) for a in da for b in db if len(a)<12 and len(b)<12]
+ delta=min(ds) if ds else 0
+ out=[len(da),len(db),math.log1p(min(delta,1000000)),float(bool(ds) and delta<=2),
+  max((fuzz.ratio(a,b)/100 for a in da for b in db),default=0)]
+ a,b=x[4].replace(' ',''),y[4].replace(' ',''); counts=Counter(op.tag for op in Levenshtein.editops(a,b))
+ out.extend(counts[k]/max(1,len(a),len(b)) for k in ['replace','insert','delete'])
+ aa,bb=x[4].split(),y[4].split()
+ sims=[max((fuzz.ratio(u,v)/100 for v in bb),default=0) for u in aa]
+ out.extend([min(sims,default=0),sum(sims)/max(1,len(sims))])
+ return out
+FAST_COLS=[0,10,11,12,20,21,22,19,29,42,43,44,45,46]
+def source_profile(split,country):
+ path=OUT/f'profile_{split}_{country}.pkl'
+ done=path.with_suffix('.done')
+ if path.exists() and done.exists():
+  with path.open('rb') as f: return pickle.load(f)
+ names=Counter(); joint=Counter()
+ for source in [2,3]:
+  for r in normalized_rows(split,source,country):
+   names[r[4]]+=1; joint[(r[4],r[2])]+=1
+ with path.open('wb') as f: pickle.dump((names,joint),f,pickle.HIGHEST_PROTOCOL)
+ done.write_text(str(VERSION),encoding='utf-8')
+ return names,joint
+def source_context(r,profile):
+ return [math.log1p(min(1000,profile[0][r[4]])),math.log1p(min(1000,profile[1][(r[4],r[2])]))]
+def fast_features(x,y,context):
+ n=bool(x[1] and y[1]); c=bool(x[4] and y[4]); a=bool(x[2] and y[2])
+ return [fuzz.ratio(x[1],y[1])/100 if n else 0,
+  fuzz.ratio(x[4],y[4])/100 if c else 0,
+  fuzz.token_sort_ratio(x[4],y[4])/100 if c else 0,
+  fuzz.token_set_ratio(x[4],y[4])/100 if c else 0,
+  fuzz.ratio(x[2],y[2])/100 if a else 0,
+  fuzz.token_sort_ratio(x[2],y[2])/100 if a else 0,
+  fuzz.token_set_ratio(x[2],y[2])/100 if a else 0,float(not c),float(not a),*context]
+def fast_matrix(pairs,recs,context,threads):
+ """Batch C++ similarity kernels across CPU cores, preserving scalar semantics."""
+ n=len(pairs); width=9+len(context[0])+len(pairs[0][2]); out=np.empty((n,width),dtype=np.float32); gate_mask=np.zeros(n,dtype=bool)
+ for field,columns,scorers in [(1,[0],[fuzz.ratio]),(4,[1,2,3],[fuzz.ratio,fuzz.token_sort_ratio,fuzz.token_set_ratio]),
+  (2,[4,5,6],[fuzz.ratio,fuzz.token_sort_ratio,fuzz.token_set_ratio])]:
+  left=[recs[j][field] for j,r,sc in pairs]; right=[r[field] for j,r,sc in pairs]
+  missing=np.array([not a or not b for a,b in zip(left,right)])
+  for col,scorer in zip(columns,scorers):
+   raw=process.cpdist(left,right,scorer=scorer,dtype=np.float64,workers=threads).ravel()
+   out[:,col]=raw/100
+   if col in [1,2]: gate_mask|=raw>=45
+   if col==3: gate_mask|=(raw>=85)&~missing
+   if col==5: gate_mask|=(raw>=55)&~missing
+   if col==6: gate_mask|=(raw>=85)&~missing
+   out[missing,col]=0
+  if field==4: out[:,7]=missing
+  if field==2: out[:,8]=missing
+ out[:,9:]=np.array([context[j]+sc for j,r,sc in pairs],dtype=np.float32)
+ return out,gate_mask
+def context_keys(r):
+ return ('n:'+r[1],'c:'+r[4],'a:'+r[2])
+def context_features(r,counts):
+ return [math.log1p(min(1000,counts.get(k,0))) if len(k)>2 else 0. for k in context_keys(r)]
+def gate(x,y):
+ # Broad inexpensive filter, part of measured retrieval (never silently ignored).
+ return bool(max(fuzz.ratio(x[4],y[4]),fuzz.token_sort_ratio(x[4],y[4]))>=45
+  or (x[4] and y[4] and fuzz.token_set_ratio(x[4],y[4])>=85)
+  or (x[2] and y[2] and (fuzz.token_sort_ratio(x[2],y[2])>=55 or fuzz.token_set_ratio(x[2],y[2])>=85)))
+def truth(ids):
+ out={i:set() for i in ids}; seen=set()
+ with (P/'dataset/train/train_ground_truth.tsv').open(encoding='utf-8',newline='') as f:
+  for r in csv.DictReader(f,delimiter='\t'):
+   k=r['source1_entity_id']
+   if k in out:
+    seen.add(k); out[k]={x.strip() for x in r['matched_entity_ids'].split(',') if x.strip()}
+ if len(seen)!=len(out): raise ValueError(f'Missing ground-truth rows: {len(out)-len(seen)}')
+ return out
+def group(r):
+ # Exact duplicate reference records stay together; IDs are never model inputs.
+ return stable(r[3]+'|'+r[1]+'|'+r[2])%10
+def prepare(args):
+ if (OUT/'prepare_complete.json').exists(): (OUT/'prepare_complete.json').unlink()
+ selected=[]; counts=Counter()
+ for raw in rows('train',1):
+  counts[raw['country']]+=1
+  if stable(raw['entity_id'])%1000000 < args.sample_rate*1000000: selected.append(record(raw))
+ log(f'Selected {len(selected)} reference entities from {dict(counts)}')
+ gt=truth({r[0] for r in selected}); idpos={r[0]:i for i,r in enumerate(selected)}
+ groups=np.array([group(r) for r in selected],dtype=np.uint8)
+ manifest={'version':VERSION,'features':FEATURES,'sample_rate':args.sample_rate,'records':selected,
+  'truth':{k:sorted(v) for k,v in gt.items()},'groups':groups.tolist()}
+ (OUT/'training_manifest.json').write_text(json.dumps(manifest),encoding='utf-8')
+ xs=[]; meta=[]; total=0; retrieved=0; forced=0
+ with (OUT/'features.f32').open('wb') as xf,(OUT/'pairs.tsv').open('w',encoding='utf-8',newline='') as pf:
+  writer=csv.writer(pf,delimiter='\t'); writer.writerow(['anchor','candidate','label','retrieved'])
+  def flush():
+   nonlocal total
+   if xs:
+    np.asarray(xs,dtype=np.float32).tofile(xf); writer.writerows(meta)
+    total+=len(xs); xs.clear(); meta.clear(); xf.flush(); pf.flush()
+  for country in sorted({r[3] for r in selected}):
+   recs=[r for r in selected if r[3]==country]; idx=Index(recs)
+   idx.restrict_global('train',country)
+   log(f'{country}: {len(recs)} anchors, {len(idx.inv)} eligible keys')
+   # Positive injection is ONLY for fitting entities; validation/audit never use GT retrieval.
+   inject=defaultdict(list)
+   for j,r in enumerate(recs):
+    if groups[idpos[r[0]]]<6:
+     for k in gt[r[0]]: inject[k].append(j)
+   for source in [2,3]:
+    n=0
+    for raw in rows('train',source):
+     if raw['country'].lower().strip()!=country: continue
+     n+=1; r=record(raw); found={j for j in idx.query(r) if gate(recs[j],r)}
+     cand=found|set(inject.get(r[0],[]))
+     for j in cand:
+      ref=recs[j]; lab=int(r[0] in gt[ref[0]]); ret=int(j in found)
+      retrieved+=lab*ret; forced+=lab*(1-ret)
+      xs.append(features(ref,r)); meta.append([idpos[ref[0]],r[0],lab,ret])
+     if len(xs)>=20000: flush()
+     if n%500000==0: log(f'{country} S{source}: {n:,} scanned, {total+len(xs):,} pairs')
+    flush(); log(f'{country} S{source} complete')
+   del idx; gc.collect()
+ log(f'Prepared {total:,} pairs; retrieved positives {retrieved:,}; fit-only injected positives {forced:,}')
+ (OUT/'prepare_complete.json').write_text(json.dumps({'pairs':total,'seconds':time.monotonic()-START,'version':VERSION}),encoding='utf-8')
+def score_arrays(anchor,label,prob,threshold,truth_count,universe,retrieved=None):
+ mask=prob>=threshold
+ if retrieved is not None: mask &= retrieved
+ pred=np.bincount(anchor[mask],minlength=len(truth_count))
+ tp=np.bincount(anchor[mask],weights=label[mask],minlength=len(truth_count))
+ den=pred+0.25*truth_count
+ scores=np.divide(1.25*tp,den,out=np.ones(len(den)),where=den!=0)
+ return float(scores[universe].mean()),scores,pred,tp
+def fit(args):
+ import pandas as pd
+ import lightgbm as lgb
+ m=json.loads((OUT/'training_manifest.json').read_text(encoding='utf-8'))
+ complete=json.loads((OUT/'prepare_complete.json').read_text())
+ # Rename original ratio column labels; numeric feature positions are unchanged.
+ for i in [7,17,27]:
+  if m['features'][i]==FEATURES[i].replace('_ratio',''): m['features'][i]=FEATURES[i]
+ if m['version']!=VERSION or m['features']!=FEATURES: raise ValueError('Stale feature cache; rerun prepare')
+ meta=pd.read_csv(OUT/'pairs.tsv',sep='\t',dtype={'anchor':'int32','label':'uint8','retrieved':'uint8'})
+ if meta.duplicated(['anchor','candidate']).any(): raise ValueError('Duplicate candidate pairs would invalidate set-based scoring')
+ if len(meta)!=complete['pairs'] or (OUT/'features.f32').stat().st_size!=len(meta)*len(FEATURES)*4:
+  raise ValueError('Incomplete or mismatched prepared features')
+ base=np.memmap(OUT/'features.f32',dtype='float32',mode='r',shape=(len(meta),len(FEATURES)))
+ a=meta.anchor.to_numpy(); y=meta.label.to_numpy(); ret=meta.retrieved.to_numpy().astype(bool)
+ log('Measuring reference ambiguity from all training reference records')
+ wanted={r[3]+'|'+k for r in m['records'] for k in context_keys(r)}; counts=Counter()
+ for raw in rows('train',1):
+  r=record(raw)
+  for k in context_keys(r):
+   key=r[3]+'|'+k
+   if key in wanted: counts[key]+=1
+ context=np.array([[math.log1p(min(1000,counts[r[3]+'|'+k])) if len(k)>2 else 0. for k in context_keys(r)] for r in m['records']],dtype=np.float32)
+ del wanted,counts
+ log('Measuring source-record corroboration frequencies (no labels used)')
+ wanted=set(meta.candidate); source_stats={}; source_records={}
+ for country in sorted({r[3] for r in m['records']}):
+  profile=source_profile('train',country)
+  for source in [2,3]:
+   for r in normalized_rows('train',source,country):
+    if r[0] in wanted: source_stats[r[0]]=source_context(r,profile); source_records[r[0]]=r
+  del profile; gc.collect()
+ sc=np.array([source_stats[k] for k in meta.candidate],dtype=np.float32)
+ log('Building number-contradiction and character-edit features')
+ extra=np.empty((len(meta),len(EXTRA_FEATURES)),dtype=np.float32)
+ for i,(j,k) in enumerate(zip(a,meta.candidate)):
+  extra[i]=extra_features(m['records'][j],source_records[k])
+  if i and i%500000==0: log(f'Additional features: {i:,}/{len(meta):,}')
+ X=np.column_stack((base,context[a],sc,extra)); del base,wanted,source_stats,source_records,sc,extra
+ feature_names=FEATURES+CONTEXT_FEATURES+SOURCE_FEATURES+EXTRA_FEATURES
+ g=np.array(m['groups']); ng=g[a]; tc=np.array([len(m['truth'][r[0]]) for r in m['records']])
+ train=ng<6; tune=(ng>=6)&(ng<8); audit=ng>=8
+ params=dict(n_estimators=900,learning_rate=.045,num_leaves=47,min_child_samples=50,
+  reg_lambda=5.,reg_alpha=.2,colsample_bytree=.9,subsample=.85,subsample_freq=1,
+  n_jobs=args.threads,verbosity=-1,random_state=42)
+ log(f'Fit {train.sum():,}; tune {tune.sum():,}; audit {audit.sum():,}; positives {y[train].sum():,}')
+ model=lgb.LGBMClassifier(**params)
+ model.fit(X[train],y[train],eval_set=[(X[tune],y[tune])],
+  callbacks=[lgb.early_stopping(60),lgb.log_evaluation(100)],feature_name=feature_names)
+ prob=np.zeros(len(y),dtype=np.float32)
+ for start in range(0,len(y),100000): prob[start:start+100000]=probabilities(model,X[start:start+100000])
+ np.save(OUT/'validation_probabilities.npy',prob)
+ fast=lgb.LGBMClassifier(**{**params,'n_estimators':250,'num_leaves':31})
+ fast.fit(X[train][:,FAST_COLS],y[train])
+ fast_prob=np.zeros(len(y),dtype=np.float32)
+ for start in range(0,len(y),100000): fast_prob[start:start+100000]=probabilities(fast,X[start:start+100000,FAST_COLS])
+ # Use the tuning set only: lose at most 0.05% of retrieved true pairs to this speed filter.
+ positive_scores=fast_prob[tune&ret&(y==1)]
+ fast_threshold=float(min(.01,np.quantile(positive_scores,.0005))) if len(positive_scores) else 0.
+ fast_keep=fast_prob>=fast_threshold
+ prob[~fast_keep]=0.
+ np.save(OUT/'validation_probabilities.npy',prob)
+ thresholds=np.unique(np.r_[np.linspace(.01,.99,99),.995,.999,.9995])
+ tune_ids=(g>=6)&(g<8); audit_ids=g>=8
+ best=(-1,None)
+ for t in thresholds:
+  sc=score_arrays(a,y,prob,t,tc,tune_ids,ret)[0]
+  if sc>best[0]: best=(sc,float(t))
+ threshold=best[1]
+ countries=np.array([r[3] for r in m['records']]); country_thresholds={}; regional_gain=0.
+ for c in sorted(set(countries)):
+  universe=tune_ids&(countries==c)
+  values=[(score_arrays(a,y,prob,t,tc,universe,ret)[0],float(t)) for t in thresholds]
+  cs,ct=max(values,key=lambda v:v[0]); country_thresholds[c]=ct
+  regional_gain+=cs*int(universe.sum())/int(tune_ids.sum())
+ if regional_gain-best[0]<.001: country_thresholds={}
+ decision=np.array([country_thresholds.get(c,threshold) for c in countries])[a]
+ # Select the screening cutoff by end-to-end tuning score, not retrieval alone.
+ # Prefer fewer expensive comparisons among cutoffs within 0.0002 of the best score.
+ filter_options=np.unique(np.r_[fast_threshold,.0003,.001,.003,.01,.03,.05,.1,.2,.3,.4,.5])
+ filter_results=[]
+ for ft in filter_options[filter_options>=fast_threshold]:
+  value=score_arrays(a,y,prob,decision,tc,tune_ids,ret&(fast_prob>=ft))[0]
+  filter_results.append((float(ft),value))
+ best_filter_score=max(v for _,v in filter_results)
+ fast_threshold=max(ft for ft,v in filter_results if v>=best_filter_score-.0002)
+ fast_keep=fast_prob>=fast_threshold; prob[~fast_keep]=0.
+ np.save(OUT/'validation_probabilities.npy',prob)
+ np.save(OUT/'fast_probabilities.npy',fast_prob)
+ sc,scores,pred,tp=score_arrays(a,y,prob,decision,tc,audit_ids,ret)
+ oracle=score_arrays(a,y,y.astype(float),.5,tc,audit_ids,ret)[0]
+ audit_recall=float((y[audit]*ret[audit]).sum()/max(1,tc[audit_ids].sum()))
+ report={'threshold':threshold,'tuning_macro_f05':best[0],'audit_macro_f05':sc,
+  'country_thresholds':country_thresholds,'regional_tuning_gain':regional_gain-best[0],
+  'selected_tuning_macro_f05':score_arrays(a,y,prob,decision,tc,tune_ids,ret)[0],
+  'filter_tuning_results':filter_results,
+  'audit_blocking_recall':audit_recall,'audit_oracle_macro_f05':oracle,
+  'best_iteration':model.best_iteration_,'reference_sample':len(g),'pair_count':len(y),
+  'fast_threshold':fast_threshold,'fast_candidate_retention':float(fast_keep[ret].mean()),
+  'audit_fast_positive_retention':float(fast_keep[audit&ret&(y==1)].mean()),
+  'audit_postfilter_oracle_macro_f05':score_arrays(a,y,y.astype(float),.5,tc,audit_ids,ret&fast_keep)[0],
+  'country_audit':{},'seconds':time.monotonic()-START}
+ for c in sorted(set(countries)):
+  mask=audit_ids&(countries==c)
+  report['country_audit'][c]={'entities':int(mask.sum()),'macro_f05':float(scores[mask].mean()),
+   'precision':float(tp[mask].sum()/max(1,pred[mask].sum())),
+   'recall':float(tp[mask].sum()/max(1,tc[mask].sum()))}
+ # Binomial standard error does not assume observations are Bernoulli: use sample SD.
+ se=float(scores[audit_ids].std(ddof=1)/math.sqrt(audit_ids.sum()))
+ report['audit_approx_95ci']=[max(0,sc-1.96*se),min(1,sc+1.96*se)]
+ with (OUT/'audit_errors.tsv').open('w',encoding='utf-8',newline='') as f:
+  w=csv.writer(f,delimiter='\t'); w.writerow(['id','country','name','address','score','truth','predicted'])
+  for i in np.flatnonzero(audit_ids&(scores<.999)):
+   rr=m['records'][i]; pids=meta.candidate[(a==i)&ret&(prob>=decision)].tolist()
+   w.writerow([rr[0],rr[3],rr[1],rr[2],scores[i],','.join(m['truth'][rr[0]]),','.join(pids)])
+ with (OUT/'validation_model.pkl').open('wb') as f: pickle.dump(model,f)
+ (OUT/'metrics.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
+ log(json.dumps(report,indent=2))
+ # Refit on fit+tune; retain audit as genuinely unseen in the saved production model.
+ final=lgb.LGBMClassifier(**{**params,'n_estimators':max(50,model.best_iteration_)})
+ final.fit(X[ng<8],y[ng<8],feature_name=feature_names)
+ production_prob=np.zeros(len(y),dtype=np.float32)
+ for start in range(0,len(y),100000):
+  stop=min(start+100000,len(y)); mask=audit[start:stop]
+  if mask.any():
+   chunk=np.zeros(stop-start,dtype=np.float32)
+   chunk[mask]=probabilities(final,X[start:stop][mask])
+   production_prob[start:stop]=chunk
+ production_prob[~fast_keep]=0.
+ production_score,ps,pp,pt=score_arrays(a,y,production_prob,decision,tc,audit_ids,ret)
+ report['production_audit_macro_f05']=production_score
+ report['production_country_audit']={c:float(ps[audit_ids&(countries==c)].mean()) for c in sorted(set(countries))}
+ report['feature_importance']=dict(sorted(zip(feature_names,map(int,final.feature_importances_)),key=lambda kv:-kv[1]))
+ (OUT/'metrics.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
+ log(f'Production audit macro F0.5: {production_score:.6f}')
+ with (MODELS/'model.pkl').open('wb') as f: pickle.dump({'model':final,'fast_model':fast,'fast_threshold':fast_threshold,'threshold':threshold,'country_thresholds':country_thresholds,'features':feature_names,'version':VERSION},f)
+ log('Production model saved (audit entities remain excluded)')
+def predict(args):
+ model_path=Path(args.model) if args.model else MODELS/'model.pkl'
+ with model_path.open('rb') as f: bundle=pickle.load(f)
+ schemas=[FEATURES+CONTEXT_FEATURES,FEATURES+CONTEXT_FEATURES+SOURCE_FEATURES+EXTRA_FEATURES]
+ if bundle['version']!=VERSION or bundle['features'] not in schemas: raise ValueError('Incompatible model')
+ extended=len(bundle['features'])==len(schemas[1])
+ model=bundle['model']; threshold=bundle['threshold'] if args.threshold is None else args.threshold
+ countries=Counter(r['country'].lower().strip() for r in rows('test',1))
+ log(f'Test references: {dict(countries)}; threshold={threshold}')
+ signature=hashlib.sha256(model_path.read_bytes()).hexdigest()+f':{threshold}:{args.shard_size}:{VERSION}:'+hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+ manifest_path=OUT/'inference_manifest.json'
+ if manifest_path.exists():
+  old=json.loads(manifest_path.read_text())
+  if old['signature']!=signature:
+   raise ValueError('Inference outputs belong to another model/configuration. Archive them before a new run.')
+ manifest_path.write_text(json.dumps({'signature':signature,'countries':dict(countries),'shard_size':args.shard_size}),encoding='utf-8')
+ for country in sorted(countries):
+  country_threshold=threshold if args.threshold is not None else bundle.get('country_thresholds',{}).get(country,threshold)
+  log(f'Building/reusing {country} source frequencies')
+  profile=source_profile('test',country) if extended else None
+  country_records=[record(r) for r in rows('test',1) if r['country'].lower().strip()==country]
+  for start in range(0,len(country_records),args.shard_size):
+   recs=country_records[start:start+args.shard_size]
+   tag=f'{country}_{start//args.shard_size:03d}'
+   done=OUT/f'pred_{tag}.done'
+   if args.resume and done.exists(): log(f'Reuse completed {tag}'); continue
+   predict_shard(args,model,country_threshold,country,recs,tag,done,len(country_records)>args.shard_size,bundle,profile)
+  del country_records,profile; gc.collect()
+ assemble(args)
+ check()
+def predict_shard(args,model,threshold,country,recs,tag,done,restrict,bundle,profile):
+  idx=Index(recs)
+  if restrict: idx.restrict_global('test',country)
+  context=[context_features(r,idx.context_counts) for r in recs]
+  log(f'{tag}: built {len(idx.inv):,} keys for {len(recs):,} references')
+  # Pair files are streamed; no global candidate DataFrame or source-2/3 cache.
+  progress=OUT/f'progress_{tag}.json'
+  state=json.loads(progress.read_text()) if args.resume and progress.exists() else {}
+  link_path=OUT/f'links_{tag}.tsv'; candidate_path=OUT/f'candidates_{tag}.tsv'
+  if state:
+   for path,size in [(link_path,state['link_bytes']),(candidate_path,state['candidate_bytes'])]:
+    if not path.exists() or path.stat().st_size<size: raise ValueError(f'Incomplete checkpoint file: {path}')
+    with path.open('r+b') as f: f.truncate(size)
+   log(f'{tag}: resume after {state["records"]:,} source records')
+  elif progress.exists(): progress.unlink()
+  with link_path.open('a' if state else 'w',encoding='utf-8',newline='') as lf,candidate_path.open('a' if state else 'w',encoding='utf-8',newline='') as cf:
+   lw=csv.writer(lf,delimiter='\t'); cw=csv.writer(cf,delimiter='\t')
+   pairs=[]; scanned=0; skip=state.get('records',0)
+   npairs=state.get('pairs',0); nmatches=state.get('matches',0); screened=state.get('screened',0)
+   def flush():
+    nonlocal npairs,nmatches,screened
+    if not pairs: return
+    matrix,rough=fast_matrix(pairs,recs,context,args.threads)
+    screened+=int(rough.sum())
+    keep=np.zeros(len(pairs),dtype=bool)
+    if rough.any(): keep[rough]=probabilities(bundle['fast_model'],matrix[rough])>=bundle['fast_threshold']
+    full=[]; kept_pairs=[]
+    for (j,r,sc),accept in zip(pairs,keep):
+     if accept:
+      full.append(features(recs[j],r)+context[j]+sc+(extra_features(recs[j],r) if profile is not None else [])); kept_pairs.append((recs[j][0],r[0]))
+    if full:
+     probs=probabilities(model,np.asarray(full,dtype=np.float32))
+     cw.writerows(kept_pairs)
+     for pair,pr in zip(kept_pairs,probs):
+      if pr>=threshold: lw.writerow([*pair,float(pr)]); nmatches+=1
+    npairs+=len(full); pairs.clear(); lf.flush(); cf.flush()
+   for source in [2,3]:
+    for r in normalized_rows('test',source,country):
+     scanned+=1
+     if scanned<=skip: continue
+     sc=source_context(r,profile) if profile is not None else []
+     for j in idx.query(r):
+      pairs.append((j,r,sc))
+     if len(pairs)>=50000: flush()
+     if scanned%50000==0:
+      flush()
+      checkpoint={'records':scanned,'pairs':npairs,'matches':nmatches,'screened':screened,
+       'link_bytes':lf.tell(),'candidate_bytes':cf.tell()}
+      temp=progress.with_suffix('.tmp'); temp.write_text(json.dumps(checkpoint),encoding='utf-8'); commit_output(temp,progress)
+      log(f'{tag}: {scanned:,} records, {npairs:,} pairs, {nmatches:,} matches; checkpoint saved')
+    flush()
+   done.write_text(json.dumps({'records':scanned,'screened':screened,'pairs':npairs,'matches':nmatches,'threshold':threshold}),encoding='utf-8')
+  del idx; gc.collect()
+def assemble(args):
+ # SQLite external grouping bounds memory during conversion to official wide TSVs.
+ import sqlite3
+ manifest=json.loads((OUT/'inference_manifest.json').read_text())
+ expected=[f'{c}_{i:03d}' for c,n in manifest['countries'].items() for i in range(math.ceil(n/manifest['shard_size']))]
+ if any(not (OUT/f'pred_{tag}.done').exists() for tag in expected):
+  raise ValueError('Inference is incomplete. Resume predict before assembling a submission.')
+ db=sqlite3.connect(OUT/'assembly.sqlite'); db.execute('PRAGMA journal_mode=OFF'); db.execute('PRAGMA synchronous=OFF')
+ for table,prefix,header in [('matches','links','matched_entity_ids'),('candidates','candidates','candidate_entity_ids')]:
+  db.execute(f'DROP TABLE IF EXISTS {table}')
+  db.execute(f'CREATE TABLE {table}(anchor TEXT, candidate TEXT, PRIMARY KEY(anchor,candidate)) WITHOUT ROWID')
+  for path in [OUT/f'{prefix}_{tag}.tsv' for tag in sorted(expected)]:
+   with path.open(encoding='utf-8',newline='') as f:
+    batch=[]
+    for row in csv.reader(f,delimiter='\t'):
+     batch.append(row[:2])
+     if len(batch)>=50000:
+      db.executemany(f'INSERT OR IGNORE INTO {table} VALUES (?,?)',batch); db.commit(); batch=[]
+    if batch: db.executemany(f'INSERT OR IGNORE INTO {table} VALUES (?,?)',batch); db.commit()
+  filename='matching_results.tsv' if table=='matches' else 'candidate_pairs.tsv'
+  with (OUT/(filename+'.tmp')).open('w',encoding='utf-8',newline='') as f:
+   w=csv.writer(f,delimiter='\t'); w.writerow(['source1_entity_id',header])
+   for raw in rows('test',1):
+    mids=[r[0] for r in db.execute(f'SELECT candidate FROM {table} WHERE anchor=?',(raw['entity_id'],))]
+    w.writerow([raw['entity_id'],','.join(mids)])
+  commit_output(OUT/(filename+'.tmp'),RESULTS/filename)
+  log(f'Wrote {filename}')
+ db.close()
+def diagnose(args):
+ import pandas as pd
+ m=json.loads((OUT/'training_manifest.json').read_text(encoding='utf-8'))
+ met=json.loads((OUT/'metrics.json').read_text()); t=met['threshold']
+ df=pd.read_csv(OUT/'pairs.tsv',sep='\t'); p=np.load(OUT/'validation_probabilities.npy')
+ found=defaultdict(set); predicted=defaultdict(set)
+ for a,k,ret,pr in zip(df.anchor,df.candidate,df.retrieved,p):
+  if ret: found[a].add(k)
+  if ret and pr>=t: predicted[a].add(k)
+ examples=[]; wanted=set()
+ for i,r in enumerate(m['records']):
+  if m['groups'][i] not in [6,7]: continue
+  true=set(m['truth'][r[0]]); missing=true-found[i]; fn=true-predicted[i]; fp=predicted[i]-true
+  if missing or fn or fp:
+   examples.append({'reference':r,'retrieval_misses':sorted(missing),'false_negatives':sorted(fn),'false_positives':sorted(fp)})
+   wanted.update(missing|fn|fp)
+  if len(examples)>=100: break
+ records={}
+ for source in [2,3]:
+  for raw in rows('train',source):
+   if raw['entity_id'] in wanted: records[raw['entity_id']]=raw
+ (OUT/'development_errors.json').write_text(json.dumps({'examples':examples,'records':records},indent=2),encoding='utf-8')
+ log(f'Saved {len(examples)} development examples; {len(records)} related records')
+def assess(args):
+ data=json.loads((OUT/'retrieval_misses.json').read_text(encoding='utf-8'))
+ recovered=0; total=0; gated=0
+ for country in sorted({e['reference'][3] for e in data['examples']}):
+  examples=[e for e in data['examples'] if e['reference'][3]==country]
+  idx=Index([e['reference'] for e in examples]); idx.restrict_global('train',country)
+  for j,e in enumerate(examples):
+   for k in e['missing']:
+    r=record(data['records'][k]); hit=j in idx.query(r); total+=1
+    recovered+=int(hit and gate(e['reference'],r)); gated+=int(hit and not gate(e['reference'],r))
+  log(f'{country}: cumulative recovered={recovered}/{total}; rejected by broad filter={gated}')
+ (OUT/'retrieval_assessment.json').write_text(json.dumps({'recovered':recovered,'total':total,'gate_rejects':gated}),encoding='utf-8')
+def benchmark(args):
+ import psutil
+ recs=[]
+ for raw in rows('test',1):
+  if raw['country']=='India': recs.append(record(raw))
+  if len(recs)>=args.shard_size: break
+ idx=Index(recs); log(f'Index built: RSS={psutil.Process().memory_info().rss/1e9:.2f} GB')
+ idx.restrict_global('test','india'); log(f'Index filtered: {len(idx.inv):,} keys; RSS={psutil.Process().memory_info().rss/1e9:.2f} GB')
+ n=0; pairs=0; t=time.monotonic()
+ for r in normalized_rows('test',2,'india'):
+  for j in idx.query(r):
+   if gate(recs[j],r):
+    fast_features(recs[j],r,[0.,0.,0.,0.,0.]); pairs+=1
+  n+=1
+  if n>=50000: break
+ result={'references':len(recs),'records':n,'pairs':pairs,'seconds':time.monotonic()-t,'rss_gb':psutil.Process().memory_info().rss/1e9}
+ (OUT/'benchmark.json').write_text(json.dumps(result,indent=2),encoding='utf-8'); log(json.dumps(result))
+def pilot(args):
+ import cProfile,pstats,itertools
+ with (MODELS/'model.pkl').open('rb') as f: bundle=pickle.load(f)
+ profile=source_profile('test','france')
+ recs=[record(r) for r in rows('test',1) if r['country']=='France']
+ original=normalized_rows
+ globals()['normalized_rows']=lambda split,source,country: itertools.islice(original(split,source,country),5000)
+ pr=cProfile.Profile(); pr.enable()
+ predict_shard(args,bundle['model'],bundle['threshold'],'france',recs,'pilot_france',OUT/'pilot_france.done',False,bundle,profile)
+ pr.disable(); pr.dump_stats(str(OUT/'pilot.prof')); pstats.Stats(pr).sort_stats('cumtime').print_stats(20)
+def selftest():
+ assert clean('Café & Fils')=='cafe and fils'
+ x=record(dict(entity_id='S1-a',business_name='Acme Pvt Ltd',business_address='12 Main Road',country='India'))
+ y=record(dict(entity_id='S2-a',business_name='ACME PRIVATE LIMITED',business_address='12 Main Rd',country='India'))
+ assert x[1:]==y[1:]; assert len(features(x,y))==len(FEATURES)
+ assert len(set(FEATURES+CONTEXT_FEATURES))==len(FEATURES+CONTEXT_FEATURES)
+ assert len(extra_features(x,y))==len(EXTRA_FEATURES)
+ assert np.allclose(np.array(features(x,y)+[1.,2.,3.,4.,5.])[FAST_COLS],fast_features(x,y,[1.,2.,3.,4.,5.]))
+ fm,gm=fast_matrix([(0,y,[4.,5.])],[x],[[1.,2.,3.]],2)
+ assert np.allclose(fm[0],fast_features(x,y,[1.,2.,3.,4.,5.])) and gm[0]==gate(x,y)
+ variants=[y,('S3-z','','','',''),('S2-z','different','12 main street','india','different'),
+  ('S2-z','acme','', 'india','acme'),('S2-z','','12 main road','india','')]
+ fm,gm=fast_matrix([(0,r,[4.,5.]) for r in variants],[x],[[1.,2.,3.]],2)
+ for i,r in enumerate(variants):
+  assert np.array_equal(fm[i],np.asarray(fast_features(x,r,[1.,2.,3.,4.,5.]),dtype=np.float32)) and gm[i]==gate(x,r)
+ assert Index([x]).query(y)=={0}
+ a=np.array([0,0,1]); labels=np.array([1,0,0]); prob=np.array([.9,.2,.1]); tc=np.array([2,0,1])
+ sc,s,_,_=score_arrays(a,labels,prob,.5,tc,np.ones(3,dtype=bool))
+ assert np.allclose(s,[1.25/1.5,1,0])
+ assert features(('', '', '', '', ''),('', '', '', '', ''))[28]==0
+ log('Self-tests passed: normalization, feature schema, retrieval, singleton/missed-truth metric')
 def main():
-    parser = argparse.ArgumentParser(description='Amazon ML Challenge 2026 Pipeline')
-    parser.add_argument(
-        '--step',
-        choices=['all', 'block_train', 'block_test', 'eda', 'train', 'predict', 'score', 'check'],
-        default='all',
-    )
-    parser.add_argument('--split', default='test', choices=['train', 'test'],
-                        help='Data split for predict step')
-    parser.add_argument('--threshold', type=float, default=None,
-                        help='Override decision threshold for predict step')
-    parser.add_argument('--no-tfidf', action='store_true',
-                        help='Skip TF-IDF blocking (fast first submission). '
-                             'Token+Address+Prefix+Bigram still give good recall.')
-    args = parser.parse_args()
-
-    skip_tfidf = args.no_tfidf
-    step = args.step
-    log.info(f"\n🚀 Amazon ML Challenge 2026 — Step: {step.upper()}")
-    if skip_tfidf:
-        log.info("⚡ Mode: FAST (no TF-IDF)")
-    t0 = time.time()
-
-    if step == 'all':
-        run_blocking('train', 'candidate_pairs_train.tsv', skip_tfidf=skip_tfidf)
-        run_blocking('test',  'candidate_pairs.tsv',       skip_tfidf=skip_tfidf)
-        run_training()
-        run_prediction('test', args.threshold)
-        run_format_check()
-
-    elif step == 'block_train':
-        run_blocking('train', 'candidate_pairs_train.tsv', skip_tfidf=skip_tfidf)
-
-    elif step == 'block_test':
-        run_blocking('test', 'candidate_pairs.tsv', skip_tfidf=skip_tfidf)
-
-    elif step == 'eda':
-        run_eda()
-
-    elif step == 'train':
-        run_training()
-
-    elif step == 'predict':
-        run_prediction(args.split, args.threshold)
-
-    elif step == 'score':
-        run_scoring()
-
-    elif step == 'check':
-        run_format_check()
-
-    log.info(f"\n⏱  Total time: {(time.time()-t0)/60:.1f} minutes")
-
-
-if __name__ == '__main__':
-    main()
+ p=argparse.ArgumentParser(description=__doc__)
+ p.add_argument('--step',choices=['prepare','fit','predict','assemble','check','diagnose','assess','profile','profile_test','benchmark','pilot','selftest','all'],default='all')
+ p.add_argument('--sample-rate',type=float,default=.008,help='Fraction of train reference entities; all source 2/3 records are scanned')
+ p.add_argument('--threads',type=int,default=8); p.add_argument('--threshold',type=float)
+ p.add_argument('--model',help='Optional saved model bundle path for inference')
+ p.add_argument('--shard-size',type=int,default=1000000,help='Maximum reference entities in each production index')
+ p.add_argument('--resume',action='store_true',help='Reuse completed inference countries only with the same model/threshold')
+ args=p.parse_args()
+ if args.step=='selftest': selftest(); return
+ if args.step in ['prepare','all']: prepare(args)
+ if args.step in ['fit','all']: fit(args)
+ if args.step in ['predict','all']: predict(args)
+ if args.step=='assemble': assemble(args)
+ if args.step=='check': check()
+ if args.step=='diagnose': diagnose(args)
+ if args.step=='assess': assess(args)
+ if args.step=='benchmark': benchmark(args)
+ if args.step=='pilot': pilot(args)
+ if args.step=='profile':
+  for country in ['india','us']:
+   log(f'Profiling train {country}')
+   profile=source_profile('train',country); del profile; gc.collect()
+   log(f'Profiled train {country}')
+ if args.step=='profile_test':
+  for country in ['france','india','us']:
+   log(f'Profiling test {country}')
+   profile=source_profile('test',country); del profile; gc.collect()
+   log(f'Profiled test {country}')
+if __name__=='__main__': main()

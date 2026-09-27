@@ -345,5 +345,79 @@ def main():
     return 0
 
 
+"""Streaming submission verification; run after optimized inference completes."""
+import csv
+import hashlib
+import itertools
+import json
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / 'output'
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda: f.read(4 * 1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def validate_streaming():
+    started = time.monotonic()
+    valid = set()
+    for source in (2, 3):
+        with (ROOT / 'dataset' / 'test' / f'test_source{source}.tsv').open(encoding='utf-8', newline='') as f:
+            for row in csv.DictReader(f, delimiter='\t'):
+                valid.add(row['entity_id'])
+        print(f'Loaded valid IDs through source {source}: {len(valid):,}', flush=True)
+    paths = [ROOT / 'dataset' / 'test' / 'test_source1.tsv', OUT / 'matching_results.tsv', OUT / 'candidate_pairs.tsv']
+    handles = [p.open(encoding='utf-8', newline='') for p in paths]
+    readers = [csv.reader(f, delimiter='\t') for f in handles]
+    headers = [next(r) for r in readers]
+    if headers[1:] != [['source1_entity_id', 'matched_entity_ids'], ['source1_entity_id', 'candidate_entity_ids']]:
+        raise ValueError(f'Invalid output headers: {headers[1:]}')
+    id_col = headers[0].index('entity_id')
+    counts = dict(references=0, matches=0, candidates=0, empty_match_rows=0)
+    seen = set()
+    try:
+        for line, triple in enumerate(itertools.zip_longest(*readers), 2):
+            source, match, candidate = triple
+            if any(r is None for r in triple):
+                raise ValueError(f'Unequal row counts at line {line}')
+            anchor = source[id_col]
+            if len(match) != 2 or len(candidate) != 2 or match[0] != anchor or candidate[0] != anchor:
+                raise ValueError(f'Coverage/order/column mismatch at line {line}')
+            if anchor in seen:
+                raise ValueError(f'Duplicate reference {anchor}')
+            seen.add(anchor)
+            lists = [r[1].split(',') if r[1] else [] for r in (match, candidate)]
+            sets = [set(ids) for ids in lists]
+            for ids, unique in zip(lists, sets):
+                if len(ids) != len(unique) or any(not x.startswith(('S2-', 'S3-')) or x not in valid for x in unique):
+                    raise ValueError(f'Duplicate, malformed, or unknown target at line {line}')
+            if not sets[0] <= sets[1]:
+                raise ValueError(f'Match absent from candidates at line {line}')
+            counts['references'] += 1
+            counts['matches'] += len(sets[0])
+            counts['candidates'] += len(sets[1])
+            counts['empty_match_rows'] += not sets[0]
+            if counts['references'] % 250000 == 0:
+                print(counts, flush=True)
+    finally:
+        for f in handles:
+            f.close()
+    report = {'passed': True, **counts, 'valid_target_ids': len(valid),
+              'seconds': time.monotonic() - started,
+              'sha256': {p.name: digest(p) for p in paths[1:]},
+              'checks': ['headers', 'complete ordered S1 coverage', 'unique reference rows',
+                         'unique target lists', 'target ID existence', 'match subset of candidates'],
+              'score': 'Unknown: format verification does not evaluate hidden test accuracy.'}
+    (OUT / '.cache' / 'submission_verification.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+    print(json.dumps(report, indent=2), flush=True)
+
+
 if __name__ == "__main__":
     sys.exit(main())

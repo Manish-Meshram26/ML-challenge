@@ -5,6 +5,9 @@ dataset/
 
 # Model files and cache
 models/
+.deps/
+output/*
+!output/.gitkeep
 *.pkl
 *.pkl.gz
 
@@ -36,6 +39,7 @@ env/
 
 # Logs
 *.log
+*.err
 logs/
 
 # OS
