@@ -27,7 +27,7 @@ Use Python with numpy, pandas, scikit-learn, lightgbm, rapidfuzz, and text-unide
 python run_pipeline.py --step selftest
 python run_pipeline.py --step prepare --sample-rate 0.008
 python run_pipeline.py --step fit --threads 8
-python run_pipeline.py --step predict --threads 8 --shard-size 1000000
+python run_pipeline.py --step predict --threads 4 --country-workers 2 --shard-size 1000000
 python run_pipeline.py --step check
 ```
 
@@ -37,7 +37,7 @@ The current workstation run uses a limit of 1,000,000 references, allowing one i
 
 The streaming verifier checks both output files, including target ID existence and matched-subset-of-candidates. It loads the valid target ID set but streams output rows to avoid holding every candidate set in memory. The original official validator remains available in `utils/validate_submission.py`. Passing a verifier proves format correctness, not prediction accuracy.
 
-Resume an interrupted production run with `python run_pipeline.py --step predict --threads 8 --shard-size 1000000 --resume`. Checkpoints now commit every 50,000 source records, so the incomplete country resumes at its last committed position. Keep the machine running until completion. Large datasets, model files, dependencies, caches, and generated TSVs are excluded from Git; submit the TSV directly to the competition.
+Resume an interrupted production run with `python run_pipeline.py --step predict --threads 4 --country-workers 2 --shard-size 1000000 --resume`. Two country workers share the machine; the four-thread and eight-thread benchmark produced byte-identical predictions and candidates. Use `--country-workers 1` if memory is constrained. Checkpoints commit every 50,000 source records, so each incomplete country resumes at its last committed position. Keep the machine running until completion. Large datasets, model files, dependencies, caches, and generated TSVs are excluded from Git; submit the TSV directly to the competition. Active parallel progress is logged in `output/.cache/parallel.log`.
 
 ## What is being optimized, and why
 

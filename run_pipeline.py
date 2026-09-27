@@ -455,7 +455,21 @@ def predict(args):
   if old['signature']!=signature:
    raise ValueError('Inference outputs belong to another model/configuration. Archive them before a new run.')
  manifest_path.write_text(json.dumps({'signature':signature,'countries':dict(countries),'shard_size':args.shard_size}),encoding='utf-8')
- for country in sorted(countries):
+ if args.country_workers>1:
+  from concurrent.futures import ProcessPoolExecutor
+  with ProcessPoolExecutor(max_workers=args.country_workers) as pool:
+   jobs=[pool.submit(predict_country,args,bundle,country,countries[country],threshold) for country in sorted(countries)]
+   for job in jobs: job.result()
+ else:
+  for country in sorted(countries): predict_country(args,bundle,country,countries[country],threshold)
+ assemble(args)
+ check()
+
+def predict_country(args,bundle,country,count,threshold):
+  expected=[OUT/f'pred_{country}_{i:03d}.done' for i in range(math.ceil(count/args.shard_size))]
+  if args.resume and all(path.exists() for path in expected): log(f'Reuse completed {country}'); return
+  extended=len(bundle['features'])==len(FEATURES+CONTEXT_FEATURES+SOURCE_FEATURES+EXTRA_FEATURES)
+  model=bundle['model']; model.n_jobs=args.threads; bundle['fast_model'].n_jobs=args.threads
   country_threshold=threshold if args.threshold is not None else bundle.get('country_thresholds',{}).get(country,threshold)
   log(f'Building/reusing {country} source frequencies')
   profile=source_profile('test',country) if extended else None
@@ -467,8 +481,6 @@ def predict(args):
    if args.resume and done.exists(): log(f'Reuse completed {tag}'); continue
    predict_shard(args,model,country_threshold,country,recs,tag,done,len(country_records)>args.shard_size,bundle,profile)
   del country_records,profile; gc.collect()
- assemble(args)
- check()
 def predict_shard(args,model,threshold,country,recs,tag,done,restrict,bundle,profile):
   idx=Index(recs)
   if restrict: idx.restrict_global('test',country)
@@ -530,22 +542,25 @@ def assemble(args):
  if any(not (OUT/f'pred_{tag}.done').exists() for tag in expected):
   raise ValueError('Inference is incomplete. Resume predict before assembling a submission.')
  db=sqlite3.connect(OUT/'assembly.sqlite'); db.execute('PRAGMA journal_mode=OFF'); db.execute('PRAGMA synchronous=OFF')
+ db.execute('PRAGMA cache_size=-262144'); db.execute('PRAGMA mmap_size=1073741824')
  for table,prefix,header in [('matches','links','matched_entity_ids'),('candidates','candidates','candidate_entity_ids')]:
   db.execute(f'DROP TABLE IF EXISTS {table}')
-  db.execute(f'CREATE TABLE {table}(anchor TEXT, candidate TEXT, PRIMARY KEY(anchor,candidate)) WITHOUT ROWID')
+  db.execute(f'CREATE TABLE {table}(anchor TEXT, candidate TEXT)')
   for path in [OUT/f'{prefix}_{tag}.tsv' for tag in sorted(expected)]:
    with path.open(encoding='utf-8',newline='') as f:
     batch=[]
     for row in csv.reader(f,delimiter='\t'):
      batch.append(row[:2])
      if len(batch)>=50000:
-      db.executemany(f'INSERT OR IGNORE INTO {table} VALUES (?,?)',batch); db.commit(); batch=[]
-    if batch: db.executemany(f'INSERT OR IGNORE INTO {table} VALUES (?,?)',batch); db.commit()
+      db.executemany(f'INSERT INTO {table} VALUES (?,?)',batch); db.commit(); batch=[]
+    if batch: db.executemany(f'INSERT INTO {table} VALUES (?,?)',batch); db.commit()
+  log(f'Indexing {table} for output assembly')
+  db.execute(f'CREATE INDEX {table}_anchor ON {table}(anchor,candidate)'); db.commit()
   filename='matching_results.tsv' if table=='matches' else 'candidate_pairs.tsv'
   with (OUT/(filename+'.tmp')).open('w',encoding='utf-8',newline='') as f:
    w=csv.writer(f,delimiter='\t'); w.writerow(['source1_entity_id',header])
    for raw in rows('test',1):
-    mids=[r[0] for r in db.execute(f'SELECT candidate FROM {table} WHERE anchor=?',(raw['entity_id'],))]
+    mids=[r[0] for r in db.execute(f'SELECT DISTINCT candidate FROM {table} WHERE anchor=? ORDER BY candidate',(raw['entity_id'],))]
     w.writerow([raw['entity_id'],','.join(mids)])
   commit_output(OUT/(filename+'.tmp'),RESULTS/filename)
   log(f'Wrote {filename}')
@@ -638,6 +653,7 @@ def main():
  p.add_argument('--step',choices=['prepare','fit','predict','assemble','check','diagnose','assess','profile','profile_test','benchmark','pilot','selftest','all'],default='all')
  p.add_argument('--sample-rate',type=float,default=.008,help='Fraction of train reference entities; all source 2/3 records are scanned')
  p.add_argument('--threads',type=int,default=8); p.add_argument('--threshold',type=float)
+ p.add_argument('--country-workers',type=int,choices=[1,2],default=1,help='Concurrent country workers; use 2 with --threads 4 on a 16 GB workstation')
  p.add_argument('--model',help='Optional saved model bundle path for inference')
  p.add_argument('--shard-size',type=int,default=1000000,help='Maximum reference entities in each production index')
  p.add_argument('--resume',action='store_true',help='Reuse completed inference countries only with the same model/threshold')
