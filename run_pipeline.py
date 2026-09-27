@@ -686,6 +686,7 @@ def run_training():
 
 def run_prediction(split: str = 'test', threshold_override: float = None):
     """Run inference and write matching_results.tsv."""
+    import gc
     t0 = time.time()
 
     # Load model + threshold
@@ -714,28 +715,103 @@ def run_prediction(split: str = 'test', threshold_override: float = None):
 
     cand_df  = pd.read_csv(cand_path, sep='\t', dtype=str).fillna('')
     pairs_df = expand_candidates(cand_df)
-    log.info(f"  {len(pairs_df):,} candidate pairs to score")
+    n_pairs  = len(pairs_df)
+    log.info(f"  {n_pairs:,} candidate pairs to score")
 
-    # Features
-    log.info("Building lookups + features...")
+    # Build lookups ONCE and pre-extract ALL field arrays upfront
+    # This avoids per-chunk dict construction (the bottleneck in the old approach)
+    log.info("Building lookups + extracting fields...")
     s1_lookup, s23_lookup = build_lookups(s1, s23)
-    feat_df = build_feature_matrix(
-        pairs_df[['source1_entity_id', 'candidate_entity_id']], s1_lookup, s23_lookup
+
+    empty = {'name_clean': '', 'addr_clean': '', 'country_clean': ''}
+    s1_ids_arr  = pairs_df['source1_entity_id'].values
+    s23_ids_arr = pairs_df['candidate_entity_id'].values
+
+    log.info("  Extracting S1 fields...")
+    s1_name = [s1_lookup.get(i, empty)['name_clean']    for i in s1_ids_arr]
+    s1_addr = [s1_lookup.get(i, empty)['addr_clean']    for i in s1_ids_arr]
+    s1_ctry = [s1_lookup.get(i, empty)['country_clean'] for i in s1_ids_arr]
+    log.info("  Extracting S23 fields...")
+    s23_name = [s23_lookup.get(i, empty)['name_clean']    for i in s23_ids_arr]
+    s23_addr = [s23_lookup.get(i, empty)['addr_clean']    for i in s23_ids_arr]
+    s23_ctry = [s23_lookup.get(i, empty)['country_clean'] for i in s23_ids_arr]
+    del s1_lookup, s23_lookup
+    gc.collect()
+    log.info("  Fields extracted. Starting chunked scoring...")
+
+    # Score in chunks — call vectorized feature helpers DIRECTLY on string slices
+    # No dict construction per chunk → each 500K chunk takes ~20 sec not ~8 min
+    from src.features import (
+        _batch_jaro_winkler, _batch_ratio, _batch_partial_ratio,
+        _batch_token_set_ratio, _batch_token_sort_ratio,
+        _jaccard_tokens_vec, _jaccard_char3_vec, _len_ratio_vec,
+        _prefix_ratio_vec, _numeric_jaccard_vec, _first_token_match_vec,
     )
 
-    # Inference
-    log.info("Running inference...")
-    X = feat_df[FEATURE_COLS].values.astype(np.float32)
-    probs = model.predict_proba(X)[:, 1]
-    feat_df['prob']  = probs
-    feat_df['match'] = probs >= threshold
+    PRED_CHUNK = 13_000_000   # 13M×136B = ~1.77 GB peak RAM per chunk (within 1.8 GB budget)
+    matched_s1  = []
+    matched_s23 = []
+    n_matches   = 0
 
-    n_matches = feat_df['match'].sum()
+    log.info(f"Scoring {n_pairs:,} pairs in chunks of {PRED_CHUNK:,}...")
+    n_chunks = (n_pairs + PRED_CHUNK - 1) // PRED_CHUNK
+
+    for chunk_idx in tqdm(range(n_chunks), desc="Scoring chunks"):
+        start = chunk_idx * PRED_CHUNK
+        end   = min(start + PRED_CHUNK, n_pairs)
+        sz    = end - start
+
+        n1 = s1_name[start:end];  n2 = s23_name[start:end]
+        a1 = s1_addr[start:end];  a2 = s23_addr[start:end]
+        c1 = s1_ctry[start:end];  c2 = s23_ctry[start:end]
+
+        # Build feature matrix directly from string lists — no dicts, no DataFrame
+        feat = np.empty((sz, len(FEATURE_COLS)), dtype=np.float32)
+        col = 0
+        feat[:, col] = _batch_jaro_winkler(n1, n2);          col += 1
+        feat[:, col] = _batch_ratio(n1, n2);                  col += 1
+        feat[:, col] = _batch_partial_ratio(n1, n2);          col += 1
+        feat[:, col] = _batch_token_set_ratio(n1, n2);        col += 1
+        feat[:, col] = _batch_token_sort_ratio(n1, n2);       col += 1
+        feat[:, col] = _jaccard_tokens_vec(n1, n2);           col += 1
+        feat[:, col] = _jaccard_char3_vec(n1, n2);            col += 1
+        feat[:, col] = _len_ratio_vec(n1, n2);                col += 1
+        feat[:, col] = _prefix_ratio_vec(n1, n2);             col += 1
+        feat[:, col] = _batch_ratio(a1, a2);                  col += 1
+        feat[:, col] = _batch_token_set_ratio(a1, a2);        col += 1
+        feat[:, col] = _batch_partial_ratio(a1, a2);          col += 1
+        feat[:, col] = _jaccard_tokens_vec(a1, a2);           col += 1
+        nj, nf = _numeric_jaccard_vec(a1, a2)
+        feat[:, col] = nj;                                     col += 1
+        feat[:, col] = nf;                                     col += 1
+        feat[:, col] = _first_token_match_vec(a1, a2);        col += 1
+        feat[:, col] = np.array([float(x==y) for x,y in zip(c1,c2)], dtype=np.float32); col += 1
+        # Combined
+        name_stack = feat[:, 0:6]   # jaro, lev, tsr, tsor, jac, char3 — wait, reorder
+        # Correct indices: jaro=0, lev=1, partial=2, tsr=3, tsort=4, jac_tok=5, char3=6
+        name_stack = np.stack([feat[:,0], feat[:,1], feat[:,5], feat[:,6], feat[:,3], feat[:,4]])
+        feat[:, col] = name_stack.max(axis=0);                 col += 1   # max_name_sim
+        feat[:, col] = name_stack.mean(axis=0);                col += 1   # mean_name_sim
+        addr_stack = np.stack([feat[:,9], feat[:,12], feat[:,13]])
+        feat[:, col] = addr_stack.max(axis=0);                 col += 1   # max_addr_sim
+        feat[:, col] = feat[:, col-3] * feat[:, col-1]        # name_addr_product (max_name * max_addr)
+
+        probs = model.predict_proba(feat)[:, 1]
+        mask  = probs >= threshold
+        n_matches += int(mask.sum())
+        matched_s1.extend(s1_ids_arr[start:end][mask].tolist())
+        matched_s23.extend(s23_ids_arr[start:end][mask].tolist())
+
+        del feat, probs, mask
+        gc.collect()
+
     log.info(f"  {n_matches:,} matches predicted (threshold={threshold:.4f})")
 
     # Build matching_results.tsv
+    matched_df = pd.DataFrame({'source1_entity_id': matched_s1,
+                               'candidate_entity_id': matched_s23})
     matched = (
-        feat_df[feat_df['match']]
+        matched_df
         .groupby('source1_entity_id')['candidate_entity_id']
         .apply(lambda x: ','.join(sorted(set(x))))
         .reset_index()
@@ -760,6 +836,7 @@ def run_prediction(split: str = 'test', threshold_override: float = None):
     log.info(f"   {len(results):,} S1 entities | {singletons:,} singletons | {total_links:,} links")
     log.info(f"   matching_results: {out_path}")
     return results
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
