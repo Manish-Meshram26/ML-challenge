@@ -4,6 +4,8 @@ This is the consolidated optimized implementation. The final refitted model achi
 
 ## Run
 
+**Completed and verified on September 27, 2026.** Submit `output/matching_results.tsv` to the leaderboard. It contains all 1,732,544 required reference rows and 6,371,516 predicted links. The accompanying `output/candidate_pairs.tsv` contains 40,917,171 candidates. Exhaustive checks passed for coverage, duplicate rows/lists, target ID existence, and match membership in candidates; the official matching-file check also passed. Reports and file hashes are in `output/.cache/submission_verification.json` and `output/.cache/official_validation.log`. Hidden-test accuracy remains unknown.
+
 The active project tree is:
 
 ```text

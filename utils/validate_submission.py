@@ -366,6 +366,14 @@ def digest(path):
 
 
 def validate_streaming():
+    # Valid candidate lists can exceed csv's default 128 KiB field limit.
+    field_limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(field_limit)
+            break
+        except OverflowError:
+            field_limit //= 10
     started = time.monotonic()
     valid = set()
     for source in (2, 3):
